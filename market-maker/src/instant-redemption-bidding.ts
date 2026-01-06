@@ -70,7 +70,7 @@ async function getPendingRequests(): Promise<RFQRequest[]> {
             {
                 params: {
                     status: 'pending,bidding',
-                    // chainId: 98866, // Can filter by chain if needed
+                    chainId: CONFIG.SUPPORTED_CHAINS[0], // Can filter by chain if needed
                     marketMaker: CONFIG.MARKET_MAKER_ADDRESS
                 },
             },
@@ -178,6 +178,7 @@ async function submitBid(
         console.log('✅ Bid submitted successfully!');
         console.log('Bid ID:', response.data.data.bidId);
     } catch (error: any) {
+        console.log('error', error);
         console.error('❌ Failed to submit bid:', error.response?.data || error.message);
         throw error;
     }
@@ -312,7 +313,7 @@ async function monitorWonBids(processedRequests: Set<string>): Promise<void> {
 
 async function processSingleRequest(request: RFQRequest): Promise<void> {
     try {
-        console.log(`\n🎯 Processing request ${request.requestId}...`);
+        console.log(`\n🎯 Processing request11 ${request.requestId}...`);
 
         if (!shouldBidOnRequest(request)) {
             return;
