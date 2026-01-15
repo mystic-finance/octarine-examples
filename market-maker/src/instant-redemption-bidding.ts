@@ -275,6 +275,43 @@ export function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ============================================================================
+// BALANCE CHECK
+// ============================================================================
+
+const ERC20_BALANCE_ABI = [
+    'function balanceOf(address owner) view returns (uint256)',
+];
+
+/**
+ * Check if the wallet has sufficient balance of the maker token to fulfill the bid
+ */
+async function checkSufficientBalance(
+    makerToken: string,
+    makerAmount: string,
+    wallet: Wallet,
+): Promise<boolean> {
+    try {
+        const tokenContract = new ethers.Contract(makerToken, ERC20_BALANCE_ABI, wallet);
+        const balance: ethers.BigNumber = await tokenContract.balanceOf(wallet.address);
+        const requiredAmount = ethers.BigNumber.from(makerAmount);
+
+        if (balance.lt(requiredAmount)) {
+            console.log(`⏭️  Insufficient balance for bid:`);
+            console.log(`   Required: ${makerAmount}`);
+            console.log(`   Available: ${balance.toString()}`);
+            console.log(`   Token: ${makerToken}`);
+            return false;
+        }
+
+        console.log(`✅ Balance check passed: ${balance.toString()} >= ${makerAmount}`);
+        return true;
+    } catch (error: any) {
+        console.error(`❌ Failed to check balance:`, error.message);
+        return false;
+    }
+}
+
 async function monitorWonBids(processedRequests: Set<string>): Promise<void> {
     try {
         await delay(5000); // Check every few seconds
@@ -320,10 +357,19 @@ async function processSingleRequest(request: RFQRequest): Promise<void> {
 
         const makerAmount = calculateQuote(request);
 
-        // Approve token if needed
+        // Setup wallet and provider
         const provider = new ethers.providers.JsonRpcProvider(CONFIG.RPC_URL);
         const wallet = new Wallet(CONFIG.PRIVATE_KEY, provider);
 
+        // Check if we have sufficient balance to fulfill the bid
+        const makerToken = request.metadata?.rfqOrder?.makerToken ?? '';
+        const hasSufficientBalance = await checkSufficientBalance(makerToken, makerAmount, wallet);
+        if (!hasSufficientBalance) {
+            console.log(`⏭️  Skipping request ${request.requestId}: insufficient balance`);
+            return;
+        }
+
+        // Approve token if needed
         await approveTokenToExchangeProxy(
             request.metadata?.rfqOrder?.verifyingContract ?? '',
             makerAmount,
