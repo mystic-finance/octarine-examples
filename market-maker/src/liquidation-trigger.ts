@@ -82,13 +82,19 @@ interface TriggerLiquidationRequest {
 
 async function getOpenLiquidations(): Promise<Liquidation[]> {
     try {
+        const params: any = {
+            chainId: CONFIG.SUPPORTED_CHAINS[0], // Default to first supported chain
+            limit: 1000
+        };
+
+        if (CONFIG.ACCEPTED_TOKENS && CONFIG.ACCEPTED_TOKENS.length > 0 && CONFIG.ACCEPTED_TOKENS[0] !== "*") {
+            params.collateralAssets = CONFIG.ACCEPTED_TOKENS;
+        }
+
         const response = await axios.get(
-            `${CONFIG.API_BASE_URL}/redemptions/liquidations/opportunities`,
+            `${CONFIG.API_BASE_URL}/octarine/liquidations/opportunities`,
             {
-                params: {
-                    chainId: CONFIG.SUPPORTED_CHAINS[0], // Default to first supported chain
-                    limit: 1000
-                },
+                params,
             },
         );
 
@@ -283,6 +289,16 @@ function shouldLiquidate(
         console.log(`⏭️  Skipping ${liquidation._id}: unsupported chain`);
         return false;
     }
+
+    if (CONFIG.ACCEPTED_TOKENS[0] !== '*') {
+        const redeemAsset = liquidation.collateralAsset.toLowerCase();
+        const isSupported = CONFIG.ACCEPTED_TOKENS.some(t => t.toLowerCase() === redeemAsset);
+        if (!isSupported) {
+            console.log(`⏭️  Skipping ${liquidation._id}: unsupported token ${liquidation.collateralAsset}`);
+            return false;
+        }
+    }
+
 
     return true;
 }
