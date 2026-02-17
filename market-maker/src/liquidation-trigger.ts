@@ -257,7 +257,7 @@ async function triggerLiquidation(
 
     try {
         const response = await axios.post(
-            `${CONFIG.API_BASE_URL}/redemptions/liquidations/bid`,
+            `${CONFIG.API_BASE_URL}/octarine/liquidations/bid`,
             params,
             {
                 headers: {
