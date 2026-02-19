@@ -1,114 +1,99 @@
 /**
- * Web3/Ethers.js Utilities for Octarine User App
+ * Web3 Token Approval Utilities
  * 
- * This module provides blockchain interaction utilities for the user-facing
- * swap application. It handles token approvals and wallet connections.
+ * Handles ERC20 token approvals for the Octarine Exchange Proxy.
+ * Token approvals are required before the protocol can transfer tokens on 
+ * behalf of the user during swaps.
  * 
- * ## Key Concepts:
+ * ## How Token Approvals Work
  * 
- * - **Token Approvals**: ERC20 tokens require explicit approval before spending
- * - **Infinite Approvals**: Common UX pattern to approve max uint256 once
- * - **Allowance Checking**: Prevents unnecessary approval transactions
+ * 1. User wants to swap Token A for Token B
+ * 2. User must first approve the Exchange Proxy to spend Token A
+ * 3. This is a one-time approval (or unlimited for gas efficiency)
+ * 4. After approval, swaps can execute without additional approvals
  * 
- * @module Web3Service
+ * ## Security Note
+ * 
+ * Unlimited approvals (type(uint256).max) are more gas-efficient since you
+ * only pay approval gas once. However, use caution and only approve trusted
+ * protocols. Revoke approvals when no longer needed.
  */
 
-import { ethers } from 'ethers';
+import { ethers, Signer, Contract } from 'ethers';
+
+// ============================================================================
+// ABI DEFINITIONS
+// ============================================================================
+
+/**
+ * Minimal ERC20 ABI for approval operations
+ */
+const ERC20_ABI = [
+    // Read functions
+    'function allowance(address owner, address spender) view returns (uint256)',
+    'function balanceOf(address account) view returns (uint256)',
+    'function decimals() view returns (uint8)',
+    'function symbol() view returns (string)',
+    'function name() view returns (string)',
+    
+    // Write functions
+    'function approve(address spender, uint256 amount) returns (bool)',
+    
+    // Events
+    'event Approval(address indexed owner, address indexed spender, uint256 value)',
+];
 
 // ============================================================================
 // TYPE DEFINITIONS
 // ============================================================================
 
 /**
- * Result of an approval transaction.
+ * Result of an approval operation
  */
 export interface ApprovalResult {
-    /** Transaction hash if approval was submitted */
+    /** Transaction hash if a new approval was submitted */
     txHash: string | null;
-    /** Whether approval was already sufficient */
+    /** Whether sufficient allowance already existed */
     alreadyApproved: boolean;
-    /** Token symbol (if fetched) */
-    symbol?: string;
+    /** Current allowance amount */
+    allowance: string;
 }
 
 /**
- * Token information from contract.
+ * Token information
  */
 export interface TokenInfo {
+    address: string;
     symbol: string;
-    decimals: number;
     name: string;
+    decimals: number;
+    balance: string;
 }
 
 // ============================================================================
-// ERC20 ABI
+// APPROVAL FUNCTIONS
 // ============================================================================
 
 /**
- * Minimal ERC20 ABI for approval operations.
- */
-const ERC20_ABI = [
-    /**
-     * @notice Approve spender to transfer tokens
-     * @param spender Address authorized to spend
-     * @param amount Maximum amount (use MaxUint256 for unlimited)
-     */
-    'function approve(address spender, uint256 amount) external returns (bool)',
-    
-    /**
-     * @notice Check remaining allowance
-     * @param owner Token owner
-     * @param spender Authorized spender
-     * @return remaining Amount still allowed
-     */
-    'function allowance(address owner, address spender) view returns (uint256)',
-    
-    /**
-     * @notice Get token symbol
-     */
-    'function symbol() view returns (string)',
-    
-    /**
-     * @notice Get token decimals
-     */
-    'function decimals() view returns (uint8)',
-    
-    /**
-     * @notice Get token name
-     */
-    'function name() view returns (string)',
-    
-    /**
-     * @notice Get token balance
-     */
-    'function balanceOf(address account) view returns (uint256)',
-];
-
-// ============================================================================
-// TOKEN APPROVAL FUNCTIONS
-// ============================================================================
-
-/**
- * Approve a spender contract to transfer tokens on behalf of the user.
+ * Approve a spender (typically the Exchange Proxy) to spend tokens.
  * 
- * This implements the "infinite approval" pattern common in DeFi:
- * - Approve max uint256 once
- * - Avoids needing approvals for future transactions
- * - More gas-efficient for repeated use
+ * This function:
+ * 1. Checks if approval already exists
+ * 2. Submits approval transaction if needed
+ * 3. Waits for confirmation
+ * 4. Returns the result
  * 
- * For security-conscious users, custom approval amounts can be used instead.
- * 
- * @param spender - Contract address to approve (Octarine Exchange Proxy)
- * @param amount - Amount needed (for checking existing allowance)
+ * @param spender - Address to approve (e.g., Exchange Proxy)
+ * @param amount - Minimum amount needed (for comparison with existing allowance)
  * @param tokenAddress - ERC20 token contract address
- * @param signer - Ethers signer instance
+ * @param signer - Ethers signer for transaction
  * @returns Approval result with transaction details
  * 
  * @example
  * ```typescript
  * const result = await approveToken(
  *   '0xExchangeProxy...',
- *   '1000000000000000000',
+ *   '1000000000000000000', // 1 token
  *   '0xTokenAddress...',
  *   signer
  * );
@@ -124,278 +109,239 @@ export async function approveToken(
     spender: string,
     amount: string,
     tokenAddress: string,
-    signer: ethers.Signer
+    signer: Signer
 ): Promise<ApprovalResult> {
+    // Validate inputs
+    if (!spender || spender === ethers.constants.AddressZero) {
+        throw new Error('Invalid spender address');
+    }
+    if (!tokenAddress || tokenAddress === ethers.constants.AddressZero) {
+        throw new Error('Invalid token address');
+    }
+
+    // Create token contract instance
+    const tokenContract = new Contract(tokenAddress, ERC20_ABI, signer);
+
+    // Get connected wallet address
     const owner = await signer.getAddress();
 
-    console.log('[Web3] Checking token approval:', {
-        token: tokenAddress.slice(0, 10) + '...',
-        spender: spender.slice(0, 10) + '...',
-        owner: owner.slice(0, 10) + '...',
-    });
-
-    const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
-
     // Check current allowance
-    const currentAllowance: ethers.BigNumber = await tokenContract.allowance(
-        owner,
-        spender
-    );
+    let currentAllowance: ethers.BigNumber;
+    try {
+        currentAllowance = await tokenContract.allowance(owner, spender);
+    } catch (error: any) {
+        console.error('[Approval] Failed to check allowance:', error.message);
+        throw new Error(`Could not check token allowance: ${error.message}`);
+    }
 
     const requiredAmount = ethers.BigNumber.from(amount);
 
-    // If current allowance is sufficient, skip approval
-    // Using 5x buffer for future transactions
-    const bufferMultiplier = 5;
-    const requiredWithBuffer = requiredAmount.mul(bufferMultiplier);
+    // Calculate safety buffer (2x the required amount for future swaps)
+    // This minimizes the frequency of approval transactions
+    const safetyBuffer = requiredAmount.mul(2);
 
-    if (currentAllowance.gt(requiredWithBuffer)) {
-        console.log('[Web3] Token already approved (sufficient allowance)');
-        return { txHash: null, alreadyApproved: true };
+    // Check if existing allowance is sufficient
+    if (currentAllowance.gt(safetyBuffer)) {
+        console.log('[Approval] Token already approved with sufficient allowance', {
+            current: currentAllowance.toString(),
+            required: requiredAmount.toString(),
+        });
+
+        return {
+            txHash: null,
+            alreadyApproved: true,
+            allowance: currentAllowance.toString(),
+        };
     }
 
-    // Get token symbol for logging
-    let symbol: string;
+    // Need to approve - submit unlimited approval for gas efficiency
+    console.log('[Approval] Submitting approval transaction...', {
+        token: tokenAddress.slice(0, 10) + '...',
+        spender: spender.slice(0, 10) + '...',
+    });
+
     try {
-        symbol = await tokenContract.symbol();
-    } catch {
-        symbol = 'UNKNOWN';
+        // Use MaxUint256 for unlimited approval (gas efficient)
+        // This means you only need to approve once per token
+        const unlimitedAmount = ethers.constants.MaxUint256;
+
+        const tx = await tokenContract.approve(spender, unlimitedAmount);
+        console.log('[Approval] Transaction submitted:', tx.hash);
+
+        // Wait for confirmation
+        const receipt = await tx.wait(1);
+
+        console.log('[Approval] Transaction confirmed:', {
+            hash: receipt.transactionHash,
+            gasUsed: receipt.gasUsed.toString(),
+        });
+
+        return {
+            txHash: receipt.transactionHash,
+            alreadyApproved: false,
+            allowance: unlimitedAmount.toString(),
+        };
+
+    } catch (error: any) {
+        console.error('[Approval] Transaction failed:', error.message);
+
+        // Provide user-friendly error messages
+        if (error.code === 'ACTION_REJECTED') {
+            throw new Error('Approval rejected by user');
+        }
+        if (error.code === 'INSUFFICIENT_FUNDS') {
+            throw new Error('Insufficient ETH for gas fees');
+        }
+
+        throw new Error(`Approval failed: ${error.message}`);
     }
-
-    console.log(`[Web3] Approving ${symbol}...`);
-
-    // Submit approval with max uint256 (infinite approval pattern)
-    const tx = await tokenContract.approve(spender, ethers.constants.MaxUint256);
-    
-    console.log(`[Web3] Approval transaction sent: ${tx.hash}`);
-
-    // Wait for confirmation
-    const receipt = await tx.wait();
-    
-    console.log(`[Web3] Approval confirmed: ${receipt.transactionHash}`);
-
-    return {
-        txHash: receipt.transactionHash,
-        alreadyApproved: false,
-        symbol,
-    };
 }
 
 /**
- * Check if a token approval exists without submitting a transaction.
+ * Check the current token allowance without submitting a transaction.
  * 
- * Useful for UI state (showing "Approve" vs "Swap" buttons).
- * 
- * @param tokenAddress - ERC20 token address
- * @param owner - Token owner address
- * @param spender - Spender to check
- * @param provider - Ethers provider
- * @param requiredAmount - Minimum required allowance
- * @returns true if approval exists and is sufficient
+ * @param tokenAddress - ERC20 token contract address
+ * @param spender - Spender address (e.g., Exchange Proxy)
+ * @param signer - Ethers signer or provider
+ * @returns Current allowance as string (in token's smallest unit)
  */
-export async function checkTokenApproval(
+export async function checkAllowance(
     tokenAddress: string,
-    owner: string,
     spender: string,
-    provider: ethers.providers.Provider,
-    requiredAmount: string
+    signer: Signer
+): Promise<string> {
+    const tokenContract = new Contract(tokenAddress, ERC20_ABI, signer);
+    const owner = await signer.getAddress();
+    const allowance = await tokenContract.allowance(owner, spender);
+    return allowance.toString();
+}
+
+/**
+ * Check if a token approval is sufficient for a given amount.
+ * 
+ * @param tokenAddress - ERC20 token contract address
+ * @param spender - Spender address
+ * @param requiredAmount - Amount needed (in wei)
+ * @param signer - Ethers signer
+ * @returns True if allowance is sufficient
+ */
+export async function isTokenApproved(
+    tokenAddress: string,
+    spender: string,
+    requiredAmount: string,
+    signer: Signer
 ): Promise<boolean> {
     try {
-        const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-        const allowance: ethers.BigNumber = await tokenContract.allowance(
-            owner,
-            spender
-        );
+        const allowanceStr = await checkAllowance(tokenAddress, spender, signer);
+        const allowance = ethers.BigNumber.from(allowanceStr);
         const required = ethers.BigNumber.from(requiredAmount);
-        
         return allowance.gte(required);
     } catch (error) {
-        console.error('[Web3] Failed to check approval:', error);
         return false;
     }
 }
 
 /**
- * Approve a specific amount instead of infinite approval.
+ * Get token information and balance.
  * 
- * Use this for security-conscious flows where users want to
- * approve only the exact amount needed.
- * 
- * @param spender - Contract to approve
- * @param exactAmount - Exact amount to approve
- * @param tokenAddress - Token contract address
+ * @param tokenAddress - ERC20 token contract address
  * @param signer - Ethers signer
- */
-export async function approveExactAmount(
-    spender: string,
-    exactAmount: string,
-    tokenAddress: string,
-    signer: ethers.Signer
-): Promise<ApprovalResult> {
-    const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
-
-    let symbol: string;
-    try {
-        symbol = await tokenContract.symbol();
-    } catch {
-        symbol = 'UNKNOWN';
-    }
-
-    console.log(`[Web3] Approving exact ${exactAmount} ${symbol}...`);
-
-    const tx = await tokenContract.approve(spender, exactAmount);
-    const receipt = await tx.wait();
-
-    return {
-        txHash: receipt.transactionHash,
-        alreadyApproved: false,
-        symbol,
-    };
-}
-
-// ============================================================================
-// TOKEN INFO FUNCTIONS
-// ============================================================================
-
-/**
- * Fetch token metadata from contract.
- * 
- * @param tokenAddress - ERC20 token address
- * @param provider - Ethers provider
- * @returns Token info or null if call fails
+ * @returns Token information including symbol, decimals, and balance
  */
 export async function getTokenInfo(
     tokenAddress: string,
-    provider: ethers.providers.Provider
-): Promise<TokenInfo | null> {
+    signer: Signer
+): Promise<TokenInfo> {
+    const tokenContract = new Contract(tokenAddress, ERC20_ABI, signer);
+    const owner = await signer.getAddress();
+
     try {
-        const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-        
-        const [symbol, decimals, name] = await Promise.all([
-            tokenContract.symbol().catch(() => 'UNKNOWN'),
-            tokenContract.decimals().catch(() => 18),
-            tokenContract.name().catch(() => 'Unknown Token'),
+        const [symbol, name, decimals, balance] = await Promise.all([
+            tokenContract.symbol(),
+            tokenContract.name(),
+            tokenContract.decimals(),
+            tokenContract.balanceOf(owner),
         ]);
 
-        return { symbol, decimals, name };
-    } catch (error) {
-        console.error('[Web3] Failed to fetch token info:', error);
-        return null;
+        return {
+            address: tokenAddress,
+            symbol,
+            name,
+            decimals,
+            balance: balance.toString(),
+        };
+    } catch (error: any) {
+        console.error('[Token] Failed to get token info:', error.message);
+        throw new Error(`Could not fetch token information: ${error.message}`);
     }
 }
 
 /**
- * Format token amount for display.
+ * Format a token amount from wei to human-readable format.
  * 
- * @param amountWei - Amount in wei
+ * @param amount - Amount in wei (smallest unit)
  * @param decimals - Token decimals (default: 18)
- * @returns Formatted string (e.g., "1,234.567")
- */
-export function formatTokenAmount(
-    amountWei: string,
-    decimals: number = 18
-): string {
-    try {
-        const formatted = ethers.utils.formatUnits(amountWei, decimals);
-        
-        // Format with commas and reasonable precision
-        const number = parseFloat(formatted);
-        if (number === 0) return '0';
-        
-        // Use 6 decimal places for small numbers, fewer for large
-        const precision = number < 1 ? 6 : number < 1000 ? 4 : 2;
-        return number.toLocaleString('en-US', {
-            minimumFractionDigits: 0,
-            maximumFractionDigits: precision,
-        });
-    } catch {
-        return amountWei;
-    }
-}
-
-/**
- * Parse user input to wei string.
+ * @returns Formatted string
  * 
- * @param amount - User input (e.g., "1.5")
- * @param decimals - Token decimals
- * @returns Amount in wei as string
+ * @example
+ * ```typescript
+ * formatTokenAmount('1000000000000000000', 18); // '1.0'
+ * formatTokenAmount('1000000', 6);              // '1.0'
+ * ```
  */
-export function parseTokenAmount(
-    amount: string,
-    decimals: number = 18
-): string {
+export function formatTokenAmount(amount: string, decimals: number = 18): string {
     try {
-        return ethers.utils.parseUnits(amount, decimals).toString();
-    } catch {
+        return ethers.utils.formatUnits(amount, decimals);
+    } catch (error) {
         return '0';
     }
 }
 
-// ============================================================================
-// WALLET CONNECTION
-// ============================================================================
-
 /**
- * Request wallet connection and return provider/signer.
+ * Parse a human-readable amount to wei.
  * 
- * @returns Object with provider, signer, and connected address
- * @throws Error if wallet not installed or user rejects
+ * @param amount - Human-readable amount (e.g., "1.5")
+ * @param decimals - Token decimals (default: 18)
+ * @returns Amount in wei as string
+ * 
+ * @example
+ * ```typescript
+ * parseTokenAmount('1.5', 18); // '1500000000000000000'
+ * parseTokenAmount('100', 6);  // '100000000'
+ * ```
  */
-export async function connectWallet(): Promise<{
-    provider: ethers.providers.Web3Provider;
-    signer: ethers.Signer;
-    address: string;
-}> {
-    if (!window.ethereum) {
-        throw new Error('No Ethereum wallet detected. Please install MetaMask.');
+export function parseTokenAmount(amount: string, decimals: number = 18): string {
+    try {
+        return ethers.utils.parseUnits(amount, decimals).toString();
+    } catch (error) {
+        return '0';
     }
-
-    const provider = new ethers.providers.Web3Provider(window.ethereum);
-    
-    // Request account access
-    const accounts = await provider.send('eth_requestAccounts', []);
-    
-    if (!accounts || accounts.length === 0) {
-        throw new Error('No accounts available. Please unlock your wallet.');
-    }
-
-    const signer = provider.getSigner();
-    const address = await signer.getAddress();
-
-    return { provider, signer, address };
 }
 
 /**
- * Get current chain ID from wallet.
+ * Revoke token approval by setting allowance to 0.
+ * Use this to remove approvals for tokens you no longer use.
  * 
- * @param provider - Ethers provider
- * @returns Chain ID number
+ * @param tokenAddress - ERC20 token address
+ * @param spender - Spender to revoke
+ * @param signer - Ethers signer
+ * @returns Transaction hash
  */
-export async function getChainId(
-    provider: ethers.providers.Provider
-): Promise<number> {
-    const network = await provider.getNetwork();
-    return network.chainId;
-}
+export async function revokeApproval(
+    tokenAddress: string,
+    spender: string,
+    signer: Signer
+): Promise<string> {
+    const tokenContract = new Contract(tokenAddress, ERC20_ABI, signer);
 
-/**
- * Check if connected to correct network.
- * 
- * @param provider - Ethers provider
- * @param expectedChainId - Expected chain ID
- * @returns true if on correct network
- */
-export async function isCorrectNetwork(
-    provider: ethers.providers.Provider,
-    expectedChainId: number
-): Promise<boolean> {
-    const chainId = await getChainId(provider);
-    return chainId === expectedChainId;
-}
+    console.log('[Approval] Revoking approval...', {
+        token: tokenAddress.slice(0, 10) + '...',
+        spender: spender.slice(0, 10) + '...',
+    });
 
-// Extend Window interface for Ethereum
-declare global {
-    interface Window {
-        ethereum?: any;
-    }
+    const tx = await tokenContract.approve(spender, 0);
+    const receipt = await tx.wait(1);
+
+    console.log('[Approval] Approval revoked:', receipt.transactionHash);
+    return receipt.transactionHash;
 }

@@ -1,179 +1,169 @@
 /**
- * Octarine User API Service
+ * Octarine API Integration for User Swaps
  * 
- * This module handles all HTTP communication with the Octarine API
- * for user-facing swap operations.
+ * This module handles all API interactions for the user swap flow:
+ * 1. Requesting quotes (both instant and RFQ-based)
+ * 2. Polling for bids during RFQ auctions
+ * 3. Recording fills after successful swaps
  * 
- * ## Swap Flow:
+ * ## Swap Types
  * 
- * 1. **Quote Request**: User submits swap intent (tokenIn, tokenOut, amount)
- * 2. **Route Selection**: API returns either:
- *    - "instant": Pre-approved quote ready for immediate execution
- *    - "rfq": Request goes to market maker auction
- * 3. **Auction (RFQ only)**: Market makers bid, best price wins
- * 4. **Execution**: User signs and submits transaction on-chain
- * 5. **Confirmation**: API records successful fill
+ * **Instant Swap**: Pre-approved quote that can execute immediately
+ * **RFQ (Request for Quote)**: Competitive bidding process where market makers 
+ * submit quotes, and the best one is selected
  * 
- * ## API Endpoints:
+ * ## Usage Flow
  * 
- * - `POST /octarine/swap` - Request a quote
- * - `GET /octarine/swap/:requestId` - Check swap status/bids
- * - `POST /octarine/fill` - Record successful fill
- * 
- * @module UserAPIService
+ * 1. Call `createQuoteRequest()` to get initial quote
+ * 2. If instant: use `executeTransaction()` with the provided txn data
+ * 3. If RFQ: poll for bids with `pollForBids()` then execute
+ * 4. Record the fill with `recordFill()`
  */
 
-import axios, { AxiosError } from 'axios';
-import { ethers } from 'ethers';
+import axios, { AxiosError, AxiosRequestConfig } from 'axios';
+import { ethers, Signer } from 'ethers';
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-/**
- * Base URL for Octarine API.
- * In production, this should be configurable via environment variables.
- */
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://api.mysticfinance.xyz';
+/** Base URL for the Octarine API */
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://api.mysticfinance.xyz';
 
-/**
- * Default slippage tolerance in percentage points.
- * 1% means the user accepts up to 1% worse than quoted price.
- */
-const DEFAULT_SLIPPAGE = 1;
+/** Default timeout for API requests (ms) */
+const DEFAULT_TIMEOUT = 30000;
 
-/**
- * Maximum time to wait for RFQ bids (in seconds).
- * After this timeout, the swap is considered failed.
- */
-const RFQ_TIMEOUT_SECONDS = 120;
+/** Default retry attempts for failed requests */
+const MAX_RETRIES = 3;
 
-/**
- * Polling interval for RFQ status checks (in milliseconds).
- */
-const POLL_INTERVAL_MS = 5000;
+/** Delay between retries (ms) - uses exponential backoff */
+const RETRY_DELAY_BASE = 1000;
 
 // ============================================================================
 // TYPE DEFINITIONS
 // ============================================================================
 
 /**
- * Parameters for requesting a swap quote.
+ * Parameters for creating a quote request
  */
 export interface QuoteRequestParams {
     /** User's wallet address */
     walletAddress: string;
-    /** Token to sell (address) */
+    /** Token address being sold (redeem asset) */
     redeemAsset: string;
-    /** Token to buy (address) */
+    /** Token address being bought (redemption asset) */
     redemptionAsset: string;
-    /** Amount to sell (in wei, as string) */
+    /** Amount to swap (in wei) */
     amount: string;
     /** Chain ID for the swap */
     chainId: number;
-    /** Slippage tolerance in percent (default: 1) */
+    /** Slippage tolerance in percentage (default: 1) */
     slippageTolerance?: number;
 }
 
 /**
- * API response for a quote request.
+ * Quote response from the API
  */
 export interface QuoteResponse {
-    /** Unique request identifier */
-    requestId: string;
-    /** Quote type: 'instant' or 'rfq' */
+    /** Type of quote: instant or rfq */
     type: 'instant' | 'rfq';
-    /** Quote details (for instant swaps) */
+    /** Unique request ID */
+    requestId: string;
+    /** Quote metadata (for instant swaps) */
     quote?: {
-        order: any;
         marketMaker: string;
+        order?: {
+            verifyingContract: string;
+            makerAmount: string;
+            takerAmount: string;
+        };
     };
     /** Transaction data (for instant swaps) */
-    txn?: {
-        to: string;
-        data: string;
-        value: string;
-    };
+    txn?: TransactionData;
 }
 
 /**
- * Bid from a market maker (for RFQ swaps).
+ * Transaction data for execution
  */
-export interface Bid {
+export interface TransactionData {
+    /** Target contract address */
+    to: string;
+    /** Transaction calldata */
+    data: string;
+    /** ETH value to send (in wei) */
+    value: string;
+    /** Estimated gas limit */
+    gasLimit?: string;
+}
+
+/**
+ * Bid from a market maker
+ */
+export interface MarketMakerBid {
+    /** Unique bid ID */
     bidId: string;
+    /** Market maker address */
     marketMaker: string;
-    takerAmount: string;
-    takerToken: string;
-    txn: {
-        to: string;
-        data: string;
-        value: string;
-    };
+    /** Amount they're offering */
+    makerAmount: string;
+    /** Transaction data to execute */
+    txn: TransactionData;
 }
 
 /**
- * RFQ status response.
+ * Result of polling for bids
  */
-export interface RFQStatusResponse {
-    /** Current auction status */
-    status: 'pending' | 'bidding' | 'solved' | 'expired';
-    /** Array of received bids */
-    bids: Bid[];
-    /** Best bid (if available) */
-    winningBid?: Bid;
-}
-
-/**
- * Result of a swap operation.
- */
-export interface SwapResult {
+export interface PollResult {
+    /** Whether the polling succeeded */
     success: boolean;
-    /** Transaction hash (if successful) */
+    /** Transaction hash if successful */
     txHash?: string;
-    /** Error message (if failed) */
+    /** Error message if failed */
     error?: string;
-    /** Market maker address (if known) */
-    marketMaker?: string;
 }
 
 // ============================================================================
-// ERROR HANDLING
+// RETRY UTILITY
 // ============================================================================
 
 /**
- * Custom error class for API-related errors.
+ * Sleep for specified milliseconds
  */
-export class APIError extends Error {
-    constructor(
-        message: string,
-        public readonly statusCode?: number,
-        public readonly responseData?: any
-    ) {
-        super(message);
-        this.name = 'APIError';
-    }
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
- * Handle API errors consistently.
+ * Retry a function with exponential backoff
  */
-function handleApiError(error: unknown, context: string): never {
-    if (error instanceof AxiosError) {
-        const statusCode = error.response?.status;
-        const responseData = error.response?.data;
-        const message = responseData?.message || error.message;
-        
-        console.error(`[API Error] ${context}:`, {
-            statusCode,
-            message,
-            url: error.config?.url,
-        });
-        
-        throw new APIError(message, statusCode, responseData);
+async function withRetry<T>(
+    fn: () => Promise<T>,
+    maxRetries: number = MAX_RETRIES,
+    context?: string
+): Promise<T> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error: any) {
+            lastError = error;
+
+            // Don't retry on 4xx errors (client errors)
+            if (error?.response?.status >= 400 && error?.response?.status < 500) {
+                console.error(`[API] ${context}: Client error, not retrying`, error.message);
+                throw error;
+            }
+
+            if (attempt < maxRetries) {
+                const delay = RETRY_DELAY_BASE * Math.pow(2, attempt);
+                console.warn(`[API] ${context}: Attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+                await sleep(delay);
+            }
+        }
     }
-    
-    console.error(`[Unexpected Error] ${context}:`, error);
-    throw new APIError(String(error));
+
+    throw lastError;
 }
 
 // ============================================================================
@@ -181,26 +171,24 @@ function handleApiError(error: unknown, context: string): never {
 // ============================================================================
 
 /**
- * Request a swap quote from the Octarine API.
+ * Request a quote from the Octarine API.
  * 
- * This is the entry point for all swaps. The API analyzes the request
- * and determines the best route:
+ * This is the entry point for all swaps. The API returns either:
+ * - An instant quote that can be executed immediately, or
+ * - An RFQ request ID that requires polling for market maker bids
  * 
- * - **Instant**: Pre-approved market maker quote, can execute immediately
- * - **RFQ**: Goes to auction, requires polling for bids
- * 
- * @param params - Swap parameters
- * @returns Quote response with type and execution data
- * @throws APIError if the request fails
+ * @param params - Quote request parameters
+ * @returns Quote response with type, requestId, and execution data
  * 
  * @example
  * ```typescript
  * const quote = await createQuoteRequest({
  *   walletAddress: '0x...',
- *   redeemAsset: '0xTokenIn...',
- *   redemptionAsset: '0xTokenOut...',
- *   amount: '1000000000000000000', // 1 token
+ *   redeemAsset: '0xaa...',     // RWA token
+ *   redemptionAsset: '0xbb...', // pUSD
+ *   amount: '1000000000000000000', // 1 token (18 decimals)
  *   chainId: 98866,
+ *   slippageTolerance: 1,
  * });
  * 
  * if (quote.type === 'instant') {
@@ -210,103 +198,137 @@ function handleApiError(error: unknown, context: string): never {
  * }
  * ```
  */
-export async function createQuoteRequest(
-    params: QuoteRequestParams
-): Promise<QuoteResponse> {
-    try {
-        console.log('[API] Requesting quote:', {
-            wallet: params.walletAddress.slice(0, 10) + '...',
-            tokenIn: params.redeemAsset.slice(0, 10) + '...',
-            tokenOut: params.redemptionAsset.slice(0, 10) + '...',
-            amount: params.amount,
-        });
+export async function createQuoteRequest(params: QuoteRequestParams): Promise<QuoteResponse> {
+    const { walletAddress, redeemAsset, redemptionAsset, amount, chainId, slippageTolerance = 1 } = params;
 
-        const response = await axios.post<QuoteResponse>(
+    console.log('[Swap] Requesting quote:', {
+        sell: `${amount} of ${redeemAsset.slice(0, 10)}...`,
+        buy: redemptionAsset.slice(0, 10) + '...',
+    });
+
+    return withRetry(async () => {
+        const response = await axios.post(
             `${API_BASE_URL}/octarine/swap`,
             {
-                walletAddress: params.walletAddress,
-                redeemAsset: params.redeemAsset,
-                redemptionAsset: params.redemptionAsset,
-                amount: params.amount,
-                chainId: params.chainId,
-                slippageTolerance: params.slippageTolerance ?? DEFAULT_SLIPPAGE,
+                walletAddress,
+                redeemAsset,
+                redemptionAsset,
+                amount,
+                chainId,
+                slippageTolerance,
+            },
+            {
+                timeout: DEFAULT_TIMEOUT,
+                headers: {
+                    'Content-Type': 'application/json',
+                },
             }
         );
 
-        console.log('[API] Quote received:', {
-            requestId: response.data.requestId,
-            type: response.data.type,
+        const data = response.data;
+        console.log('[Swap] Quote received:', {
+            type: data.type,
+            requestId: data.requestId,
         });
 
-        return response.data;
-    } catch (error) {
-        handleApiError(error, 'createQuoteRequest');
-    }
+        return data as QuoteResponse;
+    }, MAX_RETRIES, 'createQuoteRequest');
 }
 
 /**
- * Execute a blockchain transaction using the provided signer.
+ * Execute a blockchain transaction using the user's signer.
  * 
- * This submits the transaction to the connected wallet (MetaMask, etc.)
- * and waits for confirmation.
+ * This submits the transaction to the network and waits for confirmation.
+ * The transaction data comes from the quote or bid response.
  * 
- * @param txnData - Transaction data from API
- * @param signer - Ethers signer instance
+ * @param txnData - Transaction data from quote/bid
+ * @param signer - Ethers signer (connected wallet)
  * @returns Transaction hash
  * @throws Error if transaction fails
+ * 
+ * @example
+ * ```typescript
+ * const txHash = await executeTransaction(quote.txn, signer);
+ * console.log('Swap executed:', txHash);
+ * ```
  */
 export async function executeTransaction(
-    txnData: QuoteResponse['txn'],
-    signer: ethers.Signer
+    txnData: TransactionData,
+    signer: Signer
 ): Promise<string> {
-    if (!txnData) {
-        throw new Error('No transaction data provided');
-    }
-
-    console.log('[Web3] Executing transaction:', {
+    console.log('[Swap] Executing transaction:', {
         to: txnData.to,
+        dataLength: txnData.data.length,
         value: txnData.value,
     });
 
     try {
+        // Estimate gas if not provided
+        let gasLimit = txnData.gasLimit;
+        if (!gasLimit) {
+            const estimatedGas = await signer.estimateGas({
+                to: txnData.to,
+                data: txnData.data,
+                value: txnData.value,
+            });
+            // Add 20% buffer for safety
+            gasLimit = estimatedGas.mul(120).div(100).toString();
+            console.log('[Swap] Gas estimated:', estimatedGas.toString(), 'with buffer:', gasLimit);
+        }
+
+        // Send the transaction
         const tx = await signer.sendTransaction({
             to: txnData.to,
             data: txnData.data,
-            value: txnData.value || 0,
+            value: txnData.value,
+            gasLimit,
         });
 
-        console.log('[Web3] Transaction sent:', tx.hash);
+        console.log('[Swap] Transaction sent:', tx.hash);
 
-        const receipt = await tx.wait();
-        console.log('[Web3] Transaction confirmed:', receipt?.transactionHash || tx.hash);
-
-        return tx.hash;
-    } catch (error: any) {
-        console.error('[Web3] Transaction failed:', error);
+        // Wait for confirmation (1 confirmation for speed, can increase for security)
+        const receipt = await tx.wait(1);
         
-        // Provide user-friendly error messages
-        if (error.code === 'ACTION_REJECTED') {
-            throw new Error('Transaction was rejected in your wallet');
+        if (receipt.status === 0) {
+            throw new Error('Transaction failed on-chain');
         }
+
+        console.log('[Swap] Transaction confirmed:', {
+            hash: receipt.transactionHash,
+            blockNumber: receipt.blockNumber,
+            gasUsed: receipt.gasUsed.toString(),
+        });
+
+        return receipt.transactionHash;
+    } catch (error: any) {
+        console.error('[Swap] Transaction failed:', error.message);
+        
+        // Provide more helpful error messages
         if (error.code === 'INSUFFICIENT_FUNDS') {
             throw new Error('Insufficient funds for gas fees');
         }
+        if (error.code === 'UNPREDICTABLE_GAS_LIMIT') {
+            throw new Error('Transaction will fail - check token approvals and balances');
+        }
+        if (error.code === 'ACTION_REJECTED') {
+            throw new Error('Transaction rejected by user');
+        }
         
-        throw new Error(`Transaction failed: ${error.message}`);
+        throw error;
     }
 }
 
 /**
- * Record a successful fill with the Octarine API.
+ * Record a fill after successful swap execution.
  * 
- * This helps the protocol track settlement and attribute fills
- * to the correct market maker.
+ * This notifies the Octarine protocol that a swap has completed,
+ * allowing proper accounting and settlement.
  * 
- * @param requestId - Original swap request ID
- * @param txHash - Confirmed transaction hash
+ * @param requestId - The original quote request ID
+ * @param txHash - The on-chain transaction hash
  * @param filledAmount - Amount that was filled
- * @param marketMaker - Market maker address
- * @param bidId - Optional bid ID (for RFQ fills)
+ * @param marketMaker - Market maker that provided the quote
+ * @param bidId - Optional bid ID (for RFQ swaps)
  */
 export async function recordFill(
     requestId: string,
@@ -315,156 +337,201 @@ export async function recordFill(
     marketMaker: string,
     bidId?: string
 ): Promise<void> {
-    try {
-        await axios.post(`${API_BASE_URL}/octarine/fill`, {
-            requestId,
-            bidId,
-            txHash,
-            filledAmount,
-            marketMaker,
-        });
+    console.log('[Swap] Recording fill:', {
+        requestId,
+        txHash,
+        marketMaker: marketMaker.slice(0, 10) + '...',
+    });
 
-        console.log('[API] Fill recorded:', { requestId, txHash });
-    } catch (error) {
-        // Non-critical error - log but don't fail the swap
-        console.error('[API] Failed to record fill:', error);
+    try {
+        await axios.post(
+            `${API_BASE_URL}/octarine/fill`,
+            {
+                requestId,
+                bidId,
+                txHash,
+                filledAmount,
+                marketMaker,
+            },
+            {
+                timeout: 10000,
+            }
+        );
+        console.log('[Swap] Fill recorded successfully');
+    } catch (error: any) {
+        // Log but don't throw - the swap succeeded on-chain
+        console.error('[Swap] Failed to record fill (non-fatal):', error.message);
     }
 }
 
 /**
- * Poll for bids on an RFQ request.
+ * Poll for market maker bids during RFQ auction.
  * 
- * For RFQ swaps, market makers compete in an auction. This function
- * polls the API until bids are received or the timeout expires.
+ * When a quote type is 'rfq', the swap enters a competitive bidding period
+ * where market makers submit quotes. This function polls the API until:
+ * - Bids are received and one is selected
+ * - The auction times out
+ * - An error occurs
  * 
- * @param requestId - RFQ request ID
- * @param signer - Ethers signer for transaction execution
+ * @param requestId - The RFQ request ID to poll
+ * @param signer - Ethers signer for executing the winning bid
  * @param options - Polling options
- * @returns Swap result with transaction hash or error
+ * @returns Result with txHash if successful
  * 
  * @example
  * ```typescript
- * const result = await pollForBids(requestId, signer);
+ * const result = await pollForBids(requestId, signer, {
+ *   maxAttempts: 60,      // Max 60 polls
+ *   pollIntervalMs: 15000 // Poll every 15 seconds
+ * });
+ * 
  * if (result.success) {
- *   console.log('Swap complete:', result.txHash);
+ *   console.log('Swap completed:', result.txHash);
  * } else {
- *   console.error('Swap failed:', result.error);
+ *   console.log('Auction timed out');
  * }
  * ```
  */
+export interface PollOptions {
+    /** Maximum number of poll attempts (default: 60) */
+    maxAttempts?: number;
+    /** Poll interval in milliseconds (default: 15000) */
+    pollIntervalMs?: number;
+    /** Bid selection strategy: 'best' | 'first' (default: 'best') */
+    bidStrategy?: 'best' | 'first';
+}
+
 export async function pollForBids(
     requestId: string,
-    signer: ethers.Signer,
-    options: {
-        maxAttempts?: number;
-        pollIntervalMs?: number;
-    } = {}
-): Promise<SwapResult> {
-    const maxAttempts = options.maxAttempts ?? (RFQ_TIMEOUT_SECONDS * 1000) / POLL_INTERVAL_MS;
-    const pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+    signer: Signer,
+    options: PollOptions = {}
+): Promise<PollResult> {
+    const {
+        maxAttempts = 60,
+        pollIntervalMs = 15000,
+        bidStrategy = 'best',
+    } = options;
 
-    console.log(`[API] Polling for bids on ${requestId}...`);
+    console.log(`[Swap] Polling for bids on ${requestId}...`);
+    console.log(`[Swap] Config: maxAttempts=${maxAttempts}, interval=${pollIntervalMs}ms, strategy=${bidStrategy}`);
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            const response = await axios.get<RFQStatusResponse>(
-                `${API_BASE_URL}/octarine/swap/${requestId}`
+            const response = await axios.get(
+                `${API_BASE_URL}/octarine/swap/${requestId}`,
+                { timeout: 10000 }
             );
 
-            const { status, bids } = response.data;
+            const bids: MarketMakerBid[] = response.data.bids || [];
 
-            // Check if we have any bids
-            if (bids && bids.length > 0) {
-                // Select best bid (lowest takerAmount = best for user)
-                // In a production app, you might show all bids to the user
-                const bestBid = bids.reduce((best, bid) => {
-                    const bestAmount = ethers.BigNumber.from(best.takerAmount);
-                    const bidAmount = ethers.BigNumber.from(bid.takerAmount);
-                    return bidAmount.lt(bestAmount) ? bid : best;
-                });
+            if (bids.length > 0) {
+                console.log(`[Swap] Received ${bids.length} bid(s) on attempt ${attempt}`);
 
-                console.log('[API] Best bid selected:', {
-                    marketMaker: bestBid.marketMaker,
-                    bidId: bestBid.bidId,
-                });
+                // Select the best bid based on strategy
+                const selectedBid = selectBid(bids, bidStrategy);
 
-                if (!bestBid.txn) {
-                    return {
-                        success: false,
-                        error: 'Selected bid has no transaction data',
-                    };
+                if (!selectedBid.txn) {
+                    throw new Error('Selected bid has no transaction data');
                 }
 
+                console.log(`[Swap] Selected bid from ${selectedBid.marketMaker.slice(0, 10)}...`, {
+                    makerAmount: selectedBid.makerAmount,
+                    bidId: selectedBid.bidId,
+                });
+
                 // Execute the transaction
-                const txHash = await executeTransaction(bestBid.txn, signer);
+                const txHash = await executeTransaction(selectedBid.txn, signer);
 
                 // Record the fill
                 await recordFill(
                     requestId,
                     txHash,
-                    bestBid.takerAmount,
-                    bestBid.marketMaker,
-                    bestBid.bidId
+                    selectedBid.makerAmount,
+                    selectedBid.marketMaker,
+                    selectedBid.bidId
                 );
 
-                return {
-                    success: true,
-                    txHash,
-                    marketMaker: bestBid.marketMaker,
-                };
+                return { success: true, txHash };
             }
 
-            // Check if the auction expired
-            if (status === 'expired') {
-                return {
-                    success: false,
-                    error: 'Auction expired without receiving any bids',
-                };
+            // No bids yet, continue polling
+            if (attempt % 4 === 0) {
+                console.log(`[Swap] Still polling... (attempt ${attempt}/${maxAttempts})`);
             }
 
-            // Wait before next poll
-            await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+        } catch (error: any) {
+            console.error(`[Swap] Polling error on attempt ${attempt}:`, error.message);
+            
+            // Continue polling unless it's a fatal error
+            if (error?.response?.status === 404) {
+                return { success: false, error: 'Request not found' };
+            }
+        }
 
-        } catch (error) {
-            console.warn(`[API] Poll attempt ${attempt + 1} failed:`, error);
-            // Continue polling - don't fail on transient errors
+        // Wait before next poll
+        if (attempt < maxAttempts) {
+            await sleep(pollIntervalMs);
         }
     }
 
-    return {
-        success: false,
-        error: `Timeout: No bids received after ${RFQ_TIMEOUT_SECONDS} seconds`,
-    };
+    console.warn(`[Swap] Polling timed out after ${maxAttempts} attempts`);
+    return { success: false, error: 'Timeout: No bids received' };
 }
 
 /**
- * Get the best available bid without executing.
- * 
- * Useful for displaying quotes to users before they commit.
- * 
- * @param requestId - RFQ request ID
- * @returns Best bid or null if no bids yet
+ * Select the best bid from available options
  */
-export async function getBestBid(requestId: string): Promise<Bid | null> {
-    try {
-        const response = await axios.get<RFQStatusResponse>(
-            `${API_BASE_URL}/octarine/swap/${requestId}`
-        );
-
-        const { bids } = response.data;
-        
-        if (!bids || bids.length === 0) {
-            return null;
-        }
-
-        // Return best bid (lowest takerAmount)
-        return bids.reduce((best, bid) => {
-            const bestAmount = ethers.BigNumber.from(best.takerAmount);
-            const bidAmount = ethers.BigNumber.from(bid.takerAmount);
-            return bidAmount.lt(bestAmount) ? bid : best;
-        });
-    } catch (error) {
-        console.error('[API] Failed to get best bid:', error);
-        return null;
+function selectBid(bids: MarketMakerBid[], strategy: 'best' | 'first'): MarketMakerBid {
+    if (strategy === 'first' || bids.length === 1) {
+        return bids[0];
     }
+
+    // 'best' strategy - highest makerAmount
+    return bids.reduce((best, current) => {
+        try {
+            const bestAmount = ethers.BigNumber.from(best.makerAmount);
+            const currentAmount = ethers.BigNumber.from(current.makerAmount);
+            return currentAmount.gt(bestAmount) ? current : best;
+        } catch (e) {
+            // If comparison fails, keep current best
+            return best;
+        }
+    }, bids[0]);
+}
+
+/**
+ * Check the status of a swap request.
+ * Useful for checking if a previous RFQ request has been filled.
+ */
+export async function getSwapStatus(requestId: string): Promise<{
+    status: string;
+    bids: MarketMakerBid[];
+    txHash?: string;
+}> {
+    const response = await axios.get(
+        `${API_BASE_URL}/octarine/swap/${requestId}`,
+        { timeout: 10000 }
+    );
+    return response.data;
+}
+
+/**
+ * Get supported tokens for swaps.
+ */
+export async function getSupportedTokens(chainId: number): Promise<{
+    address: string;
+    symbol: string;
+    name: string;
+    decimals: number;
+}[]> {
+    return withRetry(async () => {
+        const response = await axios.get(
+            `${API_BASE_URL}/octarine/tokens`,
+            {
+                params: { chainId },
+                timeout: 10000,
+            }
+        );
+        return response.data.tokens || [];
+    }, 2, 'getSupportedTokens');
 }
