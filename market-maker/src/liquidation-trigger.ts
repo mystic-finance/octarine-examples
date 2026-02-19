@@ -1,5 +1,38 @@
 /**
- * Manual Liquidation Trigger for Market Makers
+ * Liquidation Trigger Engine
+ * 
+ * This module monitors for underwater positions in the Octarine protocol and 
+ * triggers liquidations to earn liquidation bonuses. When a borrower's health 
+ * factor drops below 1.0, their position becomes eligible for liquidation.
+ * 
+ * ## How Liquidations Work in Octarine
+ * 
+ * 1. **Borrower Position**: Users deposit collateral and borrow against it
+ * 2. **Health Factor**: Ratio of collateral value to borrowed value
+ *    - HF > 1.0: Position is healthy
+ *    - HF < 1.0: Position can be liquidated
+ * 3. **Liquidation Opportunity**: Market maker repays part of the debt
+ *    and receives a bonus amount of collateral
+ * 4. **Profit**: The bonus collateral is worth more than the debt repaid
+ * 
+ * ## Liquidation Bonus Math
+ * 
+ * Typical liquidation bonus: 5-10% depending on the asset
+ * 
+ * Example:
+ * - Debt to repay: 1000 USDC
+ * - Collateral seized: 1050 USD worth of ETH (with 5% bonus)
+ * - Gross profit: 50 USD worth of ETH
+ * - Net profit: 50 USD minus gas costs
+ * 
+ * ## Key Considerations
+ * 
+ * - **Gas Costs**: High gas can erase small liquidation profits
+ * - **Price Volatility**: Collateral value can drop during settlement
+ * - **MEV Competition**: Liquidations are competitive; speed matters
+ * - **Partial Liquidations**: Can liquidate up to 50% of position at once
+ * 
+ * @see https://docs.mysticfinance.xyz/liquidations for protocol specifics
  */
 
 import { LimitOrder, SignatureType } from '@0x/protocol-utils';
@@ -8,50 +41,74 @@ import { ethers, Wallet } from 'ethers';
 import axios from 'axios';
 import { approveTokenToExchangeProxy } from './approvals';
 import { CONFIG } from './config';
+import { logger } from './utils/logger';
+import { retry, CircuitBreaker } from './utils/retry';
+import { calculateGasParams, isProfitableAfterGas, GasStrategy } from './utils/gas';
 
 // ============================================================================
-// TYPES
+// TYPE DEFINITIONS
 // ============================================================================
 
+/**
+ * A liquidation opportunity in the protocol
+ */
 interface Liquidation {
+    /** Unique liquidation ID */
     _id: string;
+    /** Market identifier (pool + collateral + debt) */
     marketId: string;
+    /** Borrower whose position is being liquidated */
     borrower: string;
+    /** Token used as collateral */
     collateralAsset: string;
+    /** Token being borrowed (debt) */
     debtAsset: string;
+    /** Total collateral in the position */
     collateralAmount: string;
+    /** Total debt in the position */
     borrowedAmount: string;
+    /** Maximum collateral seizable (usually 50% or less) */
     collateralAmountThatCanBeSeized: string;
+    /** Health factor of the position (< 1.0 = liquidatable) */
     healthFactor: number;
+    /** Chain ID where the position exists */
     chainId: number;
+    /** Current status of the liquidation */
     status: 'pending' | 'processing' | 'completed' | 'failed';
+    /** The 0x Exchange Proxy address for this chain */
     exchangeProxy: string;
+    /** Current price of collateral in terms of debt token */
     baseFeedPrice: number;
+    /** Debt token metadata */
     borrowedPosition: {
         asset: {
-            decimals: number;
             id: string;
+            decimals: number;
             name: string;
             symbol: string;
-        }
-    }
+        };
+    };
+    /** Collateral token metadata */
     collateralPosition: {
         asset: {
-            decimals: number;
             id: string;
+            decimals: number;
             name: string;
             symbol: string;
-        }
-    }
+        };
+    };
 }
 
+/**
+ * 0x Limit Order structure for liquidation
+ */
 interface LiquidationOrderInfo {
     chainId: number;
     verifyingContract: string;
-    makerToken: string;
-    takerToken: string;
-    takerAmount: string;
-    makerAmount: string;
+    makerToken: string;      // Debt token (what we pay)
+    takerToken: string;      // Collateral token (what we receive)
+    takerAmount: string;     // Collateral to seize
+    makerAmount: string;     // Debt to repay
     pool: string;
     sender: string;
     feeRecipient: string;
@@ -60,6 +117,9 @@ interface LiquidationOrderInfo {
     salt: string;
 }
 
+/**
+ * EIP-712 signature components
+ */
 interface Signature {
     signatureType: number;
     v: number;
@@ -67,120 +127,236 @@ interface Signature {
     s: string;
 }
 
+/**
+ * Request body for triggering a liquidation via API
+ */
 interface TriggerLiquidationRequest {
     liquidationId: string;
     marketMaker: string;
     signature: Signature;
     debtAmountToLiquidate: number;
     orderInfo: any;
-    expiry: number
+    expiry: number;
+}
+
+/**
+ * Calculated amounts for a liquidation
+ */
+interface LiquidationAmounts {
+    debtToRepay: string;      // In wei, normalized to debt token decimals
+    collateralToSeize: string; // In wei, normalized to collateral token decimals
+    profitWei: string;        // Estimated profit in wei
+    debtDecimals: number;
+    collateralDecimals: number;
 }
 
 // ============================================================================
-// LOGIC
+// CIRCUIT BREAKER FOR API RESILIENCE
 // ============================================================================
 
+/** Circuit breaker for liquidation API calls */
+const liquidationCircuitBreaker = new CircuitBreaker(5, 60000);
+
+// ============================================================================
+// STEP 1: FETCH LIQUIDATION OPPORTUNITIES
+// ============================================================================
+
+/**
+ * Fetch open liquidation opportunities from the Octarine API.
+ * 
+ * Filters can be applied via configuration:
+ * - Chain ID (typically just one chain per bot instance)
+ * - Collateral assets (whitelist)
+ * 
+ * @returns Array of liquidatable positions
+ */
 async function getOpenLiquidations(): Promise<Liquidation[]> {
-    try {
-        const params: any = {
-            chainId: CONFIG.SUPPORTED_CHAINS[0], // Default to first supported chain
-            limit: 1000
-        };
+    return retry(
+        async () => {
+            const params: Record<string, any> = {
+                chainId: CONFIG.SUPPORTED_CHAINS[0],
+                limit: 1000,
+            };
 
-        if (CONFIG.ACCEPTED_TOKENS && CONFIG.ACCEPTED_TOKENS.length > 0 && CONFIG.ACCEPTED_TOKENS[0] !== "*") {
-            params.collateralAssets = CONFIG.ACCEPTED_TOKENS;
+            // Filter by accepted collateral assets if configured
+            if (CONFIG.ACCEPTED_TOKENS.length > 0 && CONFIG.ACCEPTED_TOKENS[0] !== '*') {
+                params.collateralAssets = CONFIG.ACCEPTED_TOKENS.join(',');
+            }
+
+            const response = await axios.get(
+                `${CONFIG.API_BASE_URL}/octarine/liquidations/opportunities`,
+                {
+                    params,
+                    headers: CONFIG.API_KEY ? { 'x-api-key': CONFIG.API_KEY } : {},
+                    timeout: 15000,
+                },
+            );
+
+            const liquidations = response.data.data || [];
+            logger.info(`Found ${liquidations.length} liquidation opportunities`, {
+                count: liquidations.length,
+                chainId: params.chainId,
+            });
+
+            return liquidations;
+        },
+        {
+            maxRetries: 3,
+            initialDelayMs: 2000,
+            context: { operation: 'getOpenLiquidations' },
         }
-
-        const response = await axios.get(
-            `${CONFIG.API_BASE_URL}/octarine/liquidations/opportunities`,
-            {
-                params,
-            },
-        );
-
-        const liquidations = response.data.data || [];
-        console.log(`🔍 Found ${liquidations.length} open liquidations`);
-        return liquidations;
-    } catch (error: any) {
-        console.error('❌ Failed to fetch liquidations:', error.response?.data || error.message);
-        return [];
-    }
+    );
 }
 
-function calculateLiquidationAmounts(
-    liquidation: Liquidation,
-): { debtToRepay: string; collateralToSeize: string; profit: string, collateralDecimals: number, decimals: number } {
-    const debtAmount = new BigNumber(liquidation.borrowedAmount);
-    const collateralAmount = new BigNumber(liquidation.collateralAmountThatCanBeSeized);
+// ============================================================================
+// STEP 2: CALCULATE LIQUIDATION AMOUNTS
+// ============================================================================
 
-    if (!liquidation.collateralAmountThatCanBeSeized) {
+/**
+ * Calculate optimal liquidation amounts for a position.
+ * 
+ * The goal is to maximize profit while staying within protocol limits.
+ * Most protocols allow liquidating up to 50% of an underwater position.
+ * 
+ * @param liquidation - The liquidation opportunity
+ * @returns Calculated amounts for debt repayment and collateral seizure
+ */
+function calculateLiquidationAmounts(liquidation: Liquidation): LiquidationAmounts {
+    const debtAmount = new BigNumber(liquidation.borrowedAmount);
+    const maxSeizable = new BigNumber(liquidation.collateralAmountThatCanBeSeized || 0);
+
+    const decimals = liquidation.borrowedPosition.asset.decimals ?? 18;
+    const collateralDecimals = liquidation.collateralPosition.asset.decimals ?? 18;
+
+    // No seizable collateral means we can't liquidate
+    if (maxSeizable.isZero()) {
+        logger.debug(`No collateral available for seizure`, { liquidationId: liquidation._id });
         return {
-            debtToRepay: '0', collateralToSeize: '0', profit: '0',
-            collateralDecimals: 6, decimals: 6
-        }
+            debtToRepay: '0',
+            collateralToSeize: '0',
+            profitWei: '0',
+            debtDecimals: decimals,
+            collateralDecimals,
+        };
     }
 
-    const maxLiquidationRatio = 0.8;
-    const debtToRepay = debtAmount.multipliedBy(maxLiquidationRatio);
-    const maxCollateralToSeize = collateralAmount.multipliedBy(maxLiquidationRatio);
+    // Use configured max liquidation ratio (typically 50-80%)
+    const maxRatio = CONFIG.LIQUIDATION.maxLiquidationRatio;
+    
+    // Calculate amounts based on max ratio
+    const debtToRepay = debtAmount.multipliedBy(maxRatio);
+    const collateralToSeize = maxSeizable.multipliedBy(maxRatio);
 
-    const decimals = liquidation.borrowedPosition.asset.decimals ?? 6;
-    const collateralDecimals = liquidation.collateralPosition.asset.decimals ?? 6;
+    // Rough profit estimation (actual profit depends on oracle prices and bonus)
+    // This assumes we seize more collateral value than debt repaid
+    const profitWei = collateralToSeize.minus(debtToRepay);
 
-    // Your profit is roughly the bonus capture (simplified view)
-    const profit = maxCollateralToSeize.minus(debtToRepay); // rough heuristic, depends on relative prices
+    logger.trace(`Calculated liquidation amounts for ${liquidation._id}`, {
+        liquidationId: liquidation._id,
+        debtToRepay: debtToRepay.toString(),
+        collateralToSeize: collateralToSeize.toString(),
+        estimatedProfit: profitWei.toString(),
+    });
 
     return {
-        debtToRepay: (debtToRepay.multipliedBy(10 ** decimals)).integerValue().toString(),
-        collateralToSeize: (maxCollateralToSeize.multipliedBy(10 ** collateralDecimals)).integerValue().toString(),
-        profit: profit.toString(),
+        debtToRepay: debtToRepay
+            .multipliedBy(10 ** decimals)
+            .integerValue(BigNumber.ROUND_DOWN)
+            .toString(),
+        collateralToSeize: collateralToSeize
+            .multipliedBy(10 ** collateralDecimals)
+            .integerValue(BigNumber.ROUND_DOWN)
+            .toString(),
+        profitWei: profitWei.toString(),
         decimals,
-        collateralDecimals
+        collateralDecimals,
     };
 }
 
+/**
+ * Calculate the maker amount (debt to repay) based on collateral value.
+ * 
+ * This creates a competitive quote that includes the liquidation bonus.
+ * The protocol rewards liquidators with bonus collateral, so we compete
+ * on how much of that bonus we capture versus other liquidators.
+ * 
+ * @param collateralToSeize - Amount of collateral to receive
+ * @param baseFeedPrice - Price ratio (collateral / debt)
+ * @param collateralDecimals - Decimals of collateral token
+ * @param debtDecimals - Decimals of debt token
+ * @returns Maker amount string in wei
+ */
 function calculateQuote(
     collateralToSeize: string,
     baseFeedPrice: number,
     collateralDecimals: number,
     debtDecimals: number,
-    debtToken: string,
-    collateralToken: string,
 ): string {
     const collateralAmount = new BigNumber(collateralToSeize);
-    const debtValueWei = collateralAmount.multipliedBy(baseFeedPrice);
 
-    // Apply spread for profit margin (Configurable?)
-    // Using a fixed 1% profit margin for liquidations as per example, or could use CONFIG.PRICE_SPREAD
-    // Example used 0.99.
+    // Convert collateral value to debt token terms
+    // baseFeedPrice = collateralPrice / debtPrice
+    // debtValue = collateralAmount * baseFeedPrice (adjusted for decimals)
+    const decimalAdjustment = 10 ** (debtDecimals - collateralDecimals);
+    const debtValue = collateralAmount
+        .multipliedBy(baseFeedPrice)
+        .multipliedBy(decimalAdjustment);
+
+    // Apply spread to be competitive (higher = more aggressive, lower profit)
+    // Default 0.99 means we ask for 99% of theoretical value (1% profit margin)
     const spread = 0.99;
-    const quote = debtValueWei.multipliedBy(spread).integerValue();
+    const quote = debtValue.multipliedBy(spread).integerValue(BigNumber.ROUND_DOWN);
 
     return quote.toFixed(0);
 }
 
+// ============================================================================
+// STEP 3: BUILD & SIGN LIQUIDATION ORDER
+// ============================================================================
+
+/**
+ * Build the 0x Limit Order for liquidation.
+ * 
+ * The liquidation order differs from RFQ orders:
+ * - We (maker) provide debt tokens to repay borrower's loan
+ * - We receive collateral tokens with a liquidation bonus
+ * - The taker is the protocol/anyone, not a specific user
+ * 
+ * @param liquidation - The liquidation opportunity
+ * @param amounts - Calculated liquidation amounts
+ * @returns Order info structure
+ */
 function buildLiquidationOrderInfo(
     liquidation: Liquidation,
-    amounts: { debtToRepay: string; collateralToSeize: string },
+    amounts: LiquidationAmounts,
 ): LiquidationOrderInfo {
     const salt = Date.now().toString();
-    const expiry = Math.floor(Date.now() / 1000) + (20 * 60); // 30 minutes
+    
+    // Calculate expiry based on configuration
+    const expiryMinutes = CONFIG.LIQUIDATION.bidExpiryMinutes;
+    const expiry = Math.floor(Date.now() / 1000) + (expiryMinutes * 60);
 
+    // Calculate the debt amount we need to provide
     const makerAmount = calculateQuote(
         amounts.collateralToSeize,
         liquidation.baseFeedPrice,
-        liquidation.collateralPosition.asset.decimals,
-        liquidation.borrowedPosition.asset.decimals,
-        liquidation.borrowedPosition.asset.id,
-        liquidation.collateralAsset,
+        amounts.collateralDecimals,
+        amounts.debtDecimals,
     );
+
+    logger.trace(`Built liquidation order info for ${liquidation._id}`, {
+        liquidationId: liquidation._id,
+        makerAmount,
+        takerAmount: amounts.collateralToSeize,
+        expiry,
+    });
 
     return {
         chainId: liquidation.chainId,
         verifyingContract: liquidation.exchangeProxy,
-        makerToken: liquidation.borrowedPosition.asset.id,
-        takerToken: liquidation.collateralAsset,
-        makerAmount: makerAmount,
+        makerToken: liquidation.borrowedPosition.asset.id,  // Debt token (we pay)
+        takerToken: liquidation.collateralAsset,             // Collateral (we receive)
+        makerAmount,
         takerAmount: amounts.collateralToSeize,
         pool: '0x0000000000000000000000000000000000000000000000000000000000000000',
         sender: '0x0000000000000000000000000000000000000000',
@@ -191,24 +367,38 @@ function buildLiquidationOrderInfo(
     };
 }
 
+/**
+ * Sign a liquidation order with the market maker's private key.
+ * 
+ * @param orderInfo - The order to sign
+ * @returns Signed order and signature components
+ */
 async function signLiquidationOrder(
     orderInfo: LiquidationOrderInfo,
 ): Promise<{ order: any; signature: Signature }> {
-    console.log('\n✍️  Signing liquidation order...');
-
-    const makerAmount = new BigNumber((+orderInfo.makerAmount * 1.01).toFixed(0))
-    const takerAmount = new BigNumber((+orderInfo.takerAmount * 1.01).toFixed(0));
+    logger.debug('Signing liquidation order', {
+        makerAmount: orderInfo.makerAmount,
+        takerAmount: orderInfo.takerAmount,
+    });
 
     try {
+        // Add safety buffer to amounts (protocol expects these bounds)
+        const makerAmount = new BigNumber(orderInfo.makerAmount)
+            .multipliedBy(1.01)
+            .integerValue(BigNumber.ROUND_DOWN);
+        const takerAmount = new BigNumber(orderInfo.takerAmount)
+            .multipliedBy(1.01)
+            .integerValue(BigNumber.ROUND_DOWN);
+
         const order = new LimitOrder({
             chainId: orderInfo.chainId,
             verifyingContract: orderInfo.verifyingContract,
             maker: CONFIG.MARKET_MAKER_ADDRESS,
-            taker: '0x0000000000000000000000000000000000000000',
+            taker: '0x0000000000000000000000000000000000000000', // Any taker
             makerToken: orderInfo.makerToken,
             takerToken: orderInfo.takerToken,
-            makerAmount: makerAmount,
-            takerAmount: takerAmount,
+            makerAmount,
+            takerAmount,
             takerTokenFeeAmount: new BigNumber(orderInfo.takerTokenFeeAmount),
             sender: orderInfo.sender,
             feeRecipient: orderInfo.feeRecipient,
@@ -223,7 +413,7 @@ async function signLiquidationOrder(
             SignatureType.EIP712,
         );
 
-        console.log('✅ Liquidation order signed successfully');
+        logger.debug('Liquidation order signed successfully');
 
         return {
             order: {
@@ -245,138 +435,344 @@ async function signLiquidationOrder(
             signature,
         };
     } catch (error: any) {
-        console.error('❌ Failed to sign liquidation order:', error.message);
+        logger.error('Failed to sign liquidation order', {}, error);
         throw error;
     }
 }
 
-async function triggerLiquidation(
-    params: TriggerLiquidationRequest,
-): Promise<void> {
-    console.log(`\n🚀 Triggering liquidation ${params.liquidationId}...`);
+// ============================================================================
+// STEP 4: TRIGGER LIQUIDATION
+// ============================================================================
 
-    try {
-        const response = await axios.post(
-            `${CONFIG.API_BASE_URL}/octarine/liquidations/bid`,
-            params,
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...(CONFIG.API_KEY ? { 'x-api-key': CONFIG.API_KEY } : {}),
+/**
+ * Submit the liquidation bid to the Octarine API.
+ * 
+ * This triggers the actual on-chain liquidation transaction.
+ * The API handles the settlement; we just need to submit our signed order.
+ * 
+ * @param params - Liquidation parameters including signature
+ */
+async function triggerLiquidation(params: TriggerLiquidationRequest): Promise<void> {
+    logger.info(`Triggering liquidation ${params.liquidationId}`, {
+        liquidationId: params.liquidationId,
+        debtAmount: params.debtAmountToLiquidate,
+    });
+
+    await retry(
+        async () => {
+            const response = await axios.post(
+                `${CONFIG.API_BASE_URL}/octarine/liquidations/bid`,
+                params,
+                {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...(CONFIG.API_KEY ? { 'x-api-key': CONFIG.API_KEY } : {}),
+                    },
+                    timeout: 30000,
                 },
-            },
-        );
+            );
 
-        console.log('✅ Liquidation triggered successfully!');
-        console.log('Transaction hash:', response.data.txHash);
-    } catch (error: any) {
-        console.error('❌ Failed to trigger liquidation:', error.response?.data || error.message);
-        throw error;
-    }
+            logger.success(`Liquidation triggered successfully`, 0, {
+                liquidationId: params.liquidationId,
+                txHash: response.data.txHash,
+            });
+        },
+        {
+            maxRetries: 3,
+            context: { operation: 'triggerLiquidation', liquidationId: params.liquidationId },
+        }
+    );
 }
 
+// ============================================================================
+// LIQUIDATION DECISION LOGIC
+// ============================================================================
+
+/**
+ * Determine if a liquidation opportunity is worth pursuing.
+ * 
+ * Validation criteria:
+ * 1. Health factor is below 1.0 (position is underwater)
+ * 2. Chain is supported
+ * 3. Token is not blacklisted
+ * 4. Sufficient collateral exists
+ * 5. Gas costs don't exceed expected profit
+ * 
+ * @param liquidation - The liquidation to evaluate
+ * @param amounts - Calculated amounts
+ * @returns True if the liquidation should be executed
+ */
 function shouldLiquidate(
     liquidation: Liquidation,
-    amounts: { debtToRepay: string; collateralToSeize: string },
+    amounts: LiquidationAmounts,
 ): boolean {
-    if (liquidation.healthFactor > 1.0) {
-        console.log(`⏭️  Skipping ${liquidation._id}: position is healthy (HF: ${liquidation.healthFactor})`);
+    const context = { liquidationId: liquidation._id };
+
+    // 1. Check health factor
+    if (liquidation.healthFactor >= CONFIG.LIQUIDATION.minHealthFactor) {
+        logger.trace(`Skipping: position is healthy`, {
+            ...context,
+            healthFactor: liquidation.healthFactor,
+            minRequired: CONFIG.LIQUIDATION.minHealthFactor,
+        });
         return false;
     }
 
-    // Check supported chains
+    // 2. Check chain support
     if (!CONFIG.SUPPORTED_CHAINS.includes(+liquidation.chainId)) {
-        console.log(`⏭️  Skipping ${liquidation._id}: unsupported chain`);
+        logger.trace(`Skipping: unsupported chain`, {
+            ...context,
+            chainId: liquidation.chainId,
+        });
         return false;
     }
 
-    if (CONFIG.ACCEPTED_TOKENS[0] !== '*') {
-        const redeemAsset = liquidation.collateralAsset.toLowerCase();
-        const isSupported = CONFIG.ACCEPTED_TOKENS.some(t => t.toLowerCase() === redeemAsset);
-        if (!isSupported) {
-            console.log(`⏭️  Skipping ${liquidation._id}: unsupported token ${liquidation.collateralAsset}`);
+    // 3. Check blacklist
+    if (CONFIG.RISK.blacklistedTokens.length > 0) {
+        const isBlacklisted = CONFIG.RISK.blacklistedTokens.some(
+            t => t.toLowerCase() === liquidation.collateralAsset.toLowerCase()
+        );
+        if (isBlacklisted) {
+            logger.debug(`Skipping: blacklisted collateral`, context);
             return false;
         }
     }
 
+    // 4. Check token whitelist
+    if (CONFIG.ACCEPTED_TOKENS[0] !== '*') {
+        const isCollateralAccepted = CONFIG.ACCEPTED_TOKENS.some(
+            t => t.toLowerCase() === liquidation.collateralAsset.toLowerCase()
+        );
+        const isDebtAccepted = CONFIG.ACCEPTED_TOKENS.some(
+            t => t.toLowerCase() === liquidation.debtAsset.toLowerCase()
+        );
+        if (!isCollateralAccepted || !isDebtAccepted) {
+            logger.debug(`Skipping: token not in accepted list`, context);
+            return false;
+        }
+    }
+
+    // 5. Validate amounts exist
+    if (amounts.debtToRepay === '0' || amounts.collateralToSeize === '0') {
+        logger.debug(`Skipping: no liquidatable amount`, {
+            ...context,
+            debt: amounts.debtToRepay,
+            collateral: amounts.collateralToSeize,
+        });
+        return false;
+    }
+
+    // 6. Check minimum profit margin
+    // Note: Precise gas estimation would happen right before execution
+    // This is a rough pre-filter
+    const profitRatio = new BigNumber(amounts.profitWei).dividedBy(amounts.collateralToSeize);
+    if (profitRatio.isLessThan(CONFIG.LIQUIDATION.minProfitMarginPercent / 100)) {
+        logger.debug(`Skipping: profit margin too low`, {
+            ...context,
+            profitRatio: profitRatio.toString(),
+            minRequired: `${CONFIG.LIQUIDATION.minProfitMarginPercent}%`,
+        });
+        return false;
+    }
 
     return true;
 }
 
-async function processSingleLiquidation(liquidation: Liquidation): Promise<void> {
+/**
+ * Check if we have sufficient balance of the debt token.
+ */
+async function checkDebtTokenBalance(
+    debtToken: string,
+    requiredAmount: string,
+    wallet: Wallet,
+): Promise<boolean> {
     try {
-        console.log(`\n🎯 Processing liquidation ${liquidation._id}...`);
+        const tokenContract = new ethers.Contract(
+            debtToken,
+            ['function balanceOf(address) view returns (uint256)', 'function symbol() view returns (string)'],
+            wallet.provider!
+        );
 
-        const amounts = calculateLiquidationAmounts(liquidation);
+        const [balance, symbol] = await Promise.all([
+            tokenContract.balanceOf(wallet.address),
+            tokenContract.symbol().catch(() => 'UNKNOWN'),
+        ]);
 
-        if (amounts.debtToRepay == '0' || amounts.collateralToSeize == '0') {
-            console.log(`⏭️  Skipping ${liquidation._id}: no debt or collateral to seize`);
-            return;
+        const hasBalance = balance.gte(requiredAmount);
+
+        if (!hasBalance) {
+            logger.warn(`Insufficient ${symbol} balance for liquidation`, {
+                required: requiredAmount,
+                available: balance.toString(),
+                token: symbol,
+            });
         }
+
+        return hasBalance;
+    } catch (error) {
+        logger.error('Failed to check debt token balance', {}, error as Error);
+        return false;
+    }
+}
+
+// ============================================================================
+// MAIN LIQUIDATION PROCESSING
+// ============================================================================
+
+/**
+ * Process a single liquidation opportunity end-to-end:
+ * 1. Validate the opportunity
+ * 2. Calculate amounts
+ * 3. Check balance
+ * 4. Approve debt token
+ * 5. Sign the order
+ * 6. Trigger liquidation
+ */
+async function processSingleLiquidation(
+    liquidation: Liquidation,
+    wallet: Wallet,
+): Promise<void> {
+    const context = { liquidationId: liquidation._id };
+
+    try {
+        logger.trace(`Evaluating liquidation`, {
+            ...context,
+            borrower: liquidation.borrower.slice(0, 10) + '...',
+            healthFactor: liquidation.healthFactor,
+            collateralSymbol: liquidation.collateralPosition.asset.symbol,
+            debtSymbol: liquidation.borrowedPosition.asset.symbol,
+        });
+
+        // Calculate liquidation amounts
+        const amounts = calculateLiquidationAmounts(liquidation);
 
         if (!shouldLiquidate(liquidation, amounts)) {
             return;
         }
 
+        logger.info(`💀 Liquidation opportunity found!`, {
+            ...context,
+            healthFactor: liquidation.healthFactor,
+            collateral: liquidation.collateralPosition.asset.symbol,
+            debt: liquidation.borrowedPosition.asset.symbol,
+            estimatedProfit: amounts.profitWei,
+        });
+
+        // Check debt token balance
+        const hasBalance = await checkDebtTokenBalance(
+            liquidation.debtAsset,
+            amounts.debtToRepay,
+            wallet
+        );
+        if (!hasBalance) {
+            return;
+        }
+
+        // Build order info
         const orderInfo = buildLiquidationOrderInfo(liquidation, amounts);
 
-        const provider = new ethers.providers.JsonRpcProvider(CONFIG.RPC_URL);
-        const wallet = new Wallet(CONFIG.PRIVATE_KEY, provider);
-        await approveTokenToExchangeProxy(orderInfo.verifyingContract, orderInfo.makerAmount, orderInfo.makerToken, wallet);
+        // Approve debt token for the exchange proxy
+        await approveTokenToExchangeProxy(
+            orderInfo.verifyingContract,
+            orderInfo.makerAmount,
+            orderInfo.makerToken,
+            wallet
+        );
 
+        // Sign the liquidation order
         const { order, signature } = await signLiquidationOrder(orderInfo);
 
+        // Submit liquidation bid (expiry is in minutes, convert to what API expects)
         await triggerLiquidation({
             liquidationId: liquidation._id,
             marketMaker: CONFIG.MARKET_MAKER_ADDRESS,
             signature,
-            expiry: 20,
+            expiry: CONFIG.LIQUIDATION.bidExpiryMinutes,
             orderInfo: order,
-            debtAmountToLiquidate: +amounts.debtToRepay / 10 ** +amounts.decimals,
+            debtAmountToLiquidate: parseInt(amounts.debtToRepay) / 10 ** amounts.debtDecimals,
         });
 
-        console.log(`✅ Successfully triggered liquidation ${liquidation._id}`);
+        logger.success(`Successfully processed liquidation ${liquidation._id}`, 0, context);
 
     } catch (error: any) {
-        console.error(`❌ Failed to process liquidation ${liquidation._id}:`, error.message);
+        logger.error(`Failed to process liquidation ${liquidation._id}`, context, error);
     }
 }
 
-export async function startLiquidationMonitor(): Promise<void> {
-    console.log('🚀 Starting Manual Liquidation Monitor');
-    console.log('==========================================');
-    console.log(`Market Maker: ${CONFIG.MARKET_MAKER_ADDRESS}`);
+// ============================================================================
+// MAIN LIQUIDATION LOOP
+// ============================================================================
 
+/**
+ * Start the continuous liquidation monitoring loop.
+ * This runs indefinitely, checking for underwater positions.
+ */
+export async function startLiquidationMonitor(): Promise<void> {
+    logger.info('🚀 Starting Liquidation Monitor');
+    logger.info('==========================================');
+    logger.info(`Market Maker: ${CONFIG.MARKET_MAKER_ADDRESS}`);
+    logger.info(`Min Health Factor: ${CONFIG.LIQUIDATION.minHealthFactor}`);
+    logger.info(`Max Liquidation Ratio: ${CONFIG.LIQUIDATION.maxLiquidationRatio * 100}%`);
+    logger.info(`Min Profit Margin: ${CONFIG.LIQUIDATION.minProfitMarginPercent}%`);
+    logger.info('==========================================\n');
+
+    // Track processed liquidations to avoid duplicates
     const processedLiquidations = new Set<string>();
 
+    // Setup wallet
+    const provider = new ethers.providers.JsonRpcProvider(CONFIG.RPC_URL);
+    const wallet = new Wallet(CONFIG.PRIVATE_KEY, provider);
+
     while (true) {
+        const loopStart = Date.now();
+
         try {
-            const liquidations = await getOpenLiquidations();
+            await liquidationCircuitBreaker.execute(async () => {
+                // Fetch open liquidations
+                const liquidations = await getOpenLiquidations();
 
-            for (const liquidation of liquidations) {
-                if (processedLiquidations.has(liquidation._id)) {
-                    continue;
+                // Process each liquidation
+                for (const liquidation of liquidations) {
+                    if (processedLiquidations.has(liquidation._id)) {
+                        continue;
+                    }
+
+                    await processSingleLiquidation(liquidation, wallet);
+                    processedLiquidations.add(liquidation._id);
                 }
-                await processSingleLiquidation(liquidation);
-                processedLiquidations.add(liquidation._id);
-            }
 
-            if (processedLiquidations.size > 1000) {
-                const toRemove = Array.from(processedLiquidations).slice(0, 500);
-                toRemove.forEach(id => processedLiquidations.delete(id));
-            }
-
+                // Memory cleanup
+                if (processedLiquidations.size > CONFIG.MONITORING.maxTrackedRequests) {
+                    const toRemove = Array.from(processedLiquidations).slice(0, 100);
+                    toRemove.forEach(id => processedLiquidations.delete(id));
+                    logger.debug(`Cleaned up ${toRemove.length} old liquidation entries`);
+                }
+            });
         } catch (error: any) {
-            console.error('❌ Error in liquidation monitor:', error.message);
+            if (error.message.includes('Circuit breaker is OPEN')) {
+                logger.warn('Circuit breaker open - skipping liquidation check');
+            } else {
+                logger.error('Error in liquidation monitor', {}, error);
+            }
         }
 
-        await new Promise(resolve => setTimeout(resolve, CONFIG.LIQUIDATION_POLL_INTERVAL_MS));
+        // Calculate sleep time
+        const elapsed = Date.now() - loopStart;
+        const remainingDelay = Math.max(
+            0,
+            CONFIG.MONITORING.liquidationPollIntervalMs - elapsed
+        );
+
+        if (remainingDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, remainingDelay));
+        }
     }
 }
 
+// Entry point for standalone execution
 if (require.main === module) {
     startLiquidationMonitor().catch((error) => {
-        console.error('\n❌ Liquidation monitor crashed:', error.message);
+        logger.error('Liquidation monitor crashed', {}, error);
         process.exit(1);
     });
 }
