@@ -1,0 +1,34 @@
+feat: Major improvements to market maker bot and user services
+
+Market Maker Bot Enhancements:
+- Added structured logging with configurable log levels
+- Implemented retry logic with exponential backoff
+- Added circuit breaker pattern for API resilience
+- Gas optimization with EIP-1559 support
+- Profitability checks before executing trades
+- Risk management (whitelisting, blacklisting)
+- Graceful shutdown handling
+- Extensive code comments for external market makers
+
+User Services Enhancements:
+- Retry logic with exponential backoff
+- Improved error handling
+- Bid selection strategies
+- Better gas estimation
+- Token utilities
+
+New Files:
+- utils/logger.ts
+- utils/retry.ts
+- utils/gas.ts
+- .env.example (comprehensive config)
+
+Updated Files:
+- README.md with comprehensive documentation
+- config.ts with validation
+- approvals.ts with better error handling
+- instant-redemption-bidding.ts with full comments
+- liquidation-trigger.ts with health factor monitoring
+- index.ts with proper shutdown
+
+API Documentation improvements for external market makers.
