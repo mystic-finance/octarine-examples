@@ -27,7 +27,7 @@ const ERC20_ABI = [
      * @return success Whether the approval succeeded
      */
     'function approve(address spender, uint256 amount) external returns (bool)',
-    
+
     /**
      * @notice Check remaining allowance
      * @param owner The token owner
@@ -35,20 +35,20 @@ const ERC20_ABI = [
      * @return remaining Amount still allowed
      */
     'function allowance(address owner, address spender) view returns (uint256)',
-    
+
     /**
      * @notice Get token decimals for amount formatting
      * @return decimals Number of decimal places
      */
     'function decimals() view returns (uint8)',
-    
+
     /**
      * @notice Get token balance
      * @param account The account to query
      * @return balance Token balance
      */
     'function balanceOf(address account) view returns (uint256)',
-    
+
     /**
      * @notice Get token symbol
      * @return symbol Token symbol (e.g., "USDC")
@@ -151,14 +151,14 @@ export async function approveTokenToExchangeProxy(
     // If allowance already covers the required amount, skip approval
     // Using gt (greater than) with a buffer for safety
     const safetyBuffer = requiredAmount.mul(5); // 5x buffer for future operations
-    
+
     if (currentAllowance.gt(safetyBuffer)) {
         logger.info(`Token ${tokenSymbol} already approved (allowance: ${currentAllowance.toString()})`, {
             token,
             tokenSymbol,
             alreadyApproved: true,
         });
-        
+
         return {
             txHash: null,
             alreadyApproved: true,
@@ -204,15 +204,8 @@ export async function approveTokenToExchangeProxy(
 
     // Wait for confirmation
     logger.debug('Waiting for approval confirmation...', { hash: tx.hash });
-    
-    const receipt = await retry(
-        () => tx.wait(1), // Wait for 1 confirmation
-        {
-            maxRetries: 5,
-            initialDelayMs: 2000,
-            context: { operation: 'waitForApproval', hash: tx.hash },
-        }
-    );
+
+    const receipt = await tx.wait(); // Wait for 1 confirmation
 
     logger.success('Token approval confirmed', receipt.confirmations * 1000, {
         token: tokenSymbol,
@@ -250,7 +243,7 @@ export async function checkTokenApproval(
         const tokenContract = new ethers.Contract(token, ERC20_ABI, provider);
         const allowance: ethers.BigNumber = await tokenContract.allowance(owner, spender);
         const required = ethers.BigNumber.from(requiredAmount);
-        
+
         return allowance.gte(required);
     } catch (error: any) {
         logger.error('Failed to check token approval', { token, owner, spender }, error);
@@ -269,7 +262,7 @@ export async function checkMultipleApprovals(
     provider: ethers.providers.Provider
 ): Promise<Map<string, boolean>> {
     const results = new Map<string, boolean>();
-    
+
     await Promise.all(
         tokens.map(async ({ token, requiredAmount }) => {
             const approved = await checkTokenApproval(
@@ -282,6 +275,6 @@ export async function checkMultipleApprovals(
             results.set(token, approved);
         })
     );
-    
+
     return results;
 }
