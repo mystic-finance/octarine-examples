@@ -153,7 +153,7 @@ async function checkRedemptionBidStatus(bidId: string): Promise<string | null> {
 function logRedemptionBidStats(): void {
     const now = Date.now();
     if (now - redemptionBidStats.lastLogged < 60000) return; // Log every 60s
-    
+
     redemptionBidStats.lastLogged = now;
     console.log(`[Redemption Bids] Total: ${redemptionBidStats.total}, Accepted: ${redemptionBidStats.accepted}, Pending: ${redemptionBidStats.pending}, Failed: ${redemptionBidStats.failed}`);
 }
@@ -171,6 +171,7 @@ function logRedemptionBidStats(): void {
 async function getPendingRequests(): Promise<RFQRequest[]> {
     return retry(
         async () => {
+            console.log(CONFIG)
             const response = await axios.get(
                 `${CONFIG.API_BASE_URL}/octarine/requests`,
                 {
@@ -356,7 +357,7 @@ async function submitBid(params: SubmitBidRequest): Promise<any> {
 function calculateQuote(request: RFQRequest): string {
     const takerAmount = new BigNumber(request.redeemAmount);
     const spread = CONFIG.BIDDING.priceSpread;
-    
+
     // Apply spread to determine maker amount
     const quote = takerAmount.multipliedBy(spread).integerValue(BigNumber.ROUND_DOWN);
 
@@ -471,7 +472,7 @@ async function checkSufficientBalance(
 ): Promise<boolean> {
     try {
         const tokenContract = new ethers.Contract(makerToken, ERC20_BALANCE_ABI, wallet);
-        
+
         const [balance, decimals, symbol] = await Promise.all([
             tokenContract.balanceOf(wallet.address),
             tokenContract.decimals().catch(() => 18),
@@ -582,7 +583,7 @@ async function processSingleRequest(
         if (bidId) {
             redemptionBidStats.total++;
             redemptionBidStats.pending++;
-            
+
             // Check status asynchronously
             setTimeout(async () => {
                 const status = await checkRedemptionBidStatus(bidId);

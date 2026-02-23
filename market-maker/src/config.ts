@@ -113,40 +113,40 @@ export const CONFIG = {
     // ---------------------------------------------------------------------
     // Connection Settings
     // ---------------------------------------------------------------------
-    
+
     /** Base URL for the Octarine API */
-    API_BASE_URL: getEnv('API_BASE_URL', 'https://api.mysticfinance.xyz'),
-    
+    API_BASE_URL: getEnv('API_BASE_URL', 'https://curator-api.mysticfinance.xyz'),
+
     /** API key for authenticated endpoints */
     API_KEY: process.env.MARKET_MAKER_API_KEY || '',
-    
+
     /** Market maker's private key (EVM format with 0x prefix) */
     PRIVATE_KEY: getEnv('PRIVATE_KEY'),
-    
+
     /** Market maker's wallet address */
     MARKET_MAKER_ADDRESS: getEnv('MARKET_MAKER_ADDRESS'),
-    
+
     /** RPC URL for blockchain connection */
     RPC_URL: getEnv('RPC_URL', 'https://rpc.plumenetwork.xyz'),
-    
+
     // ---------------------------------------------------------------------
     // Token & Chain Settings
     // ---------------------------------------------------------------------
-    
+
     /** Supported chains by chain ID (default: Plume mainnet = 98866) */
     SUPPORTED_CHAINS: parseIntList(process.env.SUPPORTED_CHAINS, [98866]),
-    
+
     /** 
      * Accepted token addresses for bidding/liquidation.
      * Use '*' to accept all tokens (not recommended for production).
      * @example "0x123...,0x456..."
      */
     ACCEPTED_TOKENS: parseList(process.env.ACCEPTED_TOKENS, ['*']),
-    
+
     // ---------------------------------------------------------------------
     // Liquidation Settings
     // ---------------------------------------------------------------------
-    
+
     LIQUIDATION: {
         /** Maximum portion of debt to liquidate (80% is typical max) */
         maxLiquidationRatio: parseFloat(process.env.LIQUIDATION_MAX_RATIO || '0.8'),
@@ -161,83 +161,83 @@ export const CONFIG = {
         /** How long bids remain valid */
         bidExpiryMinutes: parseInt(process.env.LIQUIDATION_BID_EXPIRY_MIN || '20', 10),
     } as LiquidationConfig,
-    
+
     // ---------------------------------------------------------------------
     // Bidding Settings
     // ---------------------------------------------------------------------
-    
+
     BIDDING: {
         /** 
          * Price spread for quotes (0.98 = 2% market maker profit).
          * Lower spread = more competitive but lower profit.
          */
         priceSpread: parseFloat(process.env.PRICE_SPREAD || '0.98'),
-        
+
         /** Minimum bid size to prevent dust transactions (in wei) */
         minBidAmountWei: process.env.MIN_BID_AMOUNT_WEI || '100',
-        
+
         /** Whether to automatically approve tokens */
         autoApproveTokens: process.env.AUTO_APPROVE_TOKENS !== 'false',
-        
+
         /** Maximum gas price for bidding txs */
         maxGasPriceGwei: parseFloat(process.env.BIDDING_MAX_GAS_GWEI || '50'),
-        
+
         /** Gas speed preference */
         gasSpeed: (process.env.BIDDING_GAS_SPEED || 'standard') as BiddingConfig['gasSpeed'],
-        
+
         /** Bid validity period */
         bidExpiryMinutes: parseInt(process.env.BIDDING_BID_EXPIRY_MIN || '60', 10),
     } as BiddingConfig,
-    
+
     // ---------------------------------------------------------------------
     // Monitoring Settings
     // ---------------------------------------------------------------------
-    
+
     MONITORING: {
         /** How often to poll for new RFQs */
         biddingPollIntervalMs: parseInt(process.env.BIDDING_POLL_INTERVAL_MS || '5000', 10),
-        
+
         /** How often to check for liquidation opportunities */
         liquidationPollIntervalMs: parseInt(process.env.LIQUIDATION_POLL_INTERVAL_MS || '10000', 10),
-        
+
         /** Max tracked items before memory cleanup */
         maxTrackedRequests: parseInt(process.env.MAX_TRACKED_REQUESTS || '1000', 10),
-        
+
         /** Health check/reporting interval */
         healthCheckIntervalMs: parseInt(process.env.HEALTH_CHECK_INTERVAL_MS || '60000', 10),
     } as MonitoringConfig,
-    
+
     // ---------------------------------------------------------------------
     // Risk Management
     // ---------------------------------------------------------------------
-    
+
     RISK: {
         /** Maximum position size in USD (0 = unlimited) */
         maxPositionUsd: parseFloat(process.env.MAX_POSITION_USD || '0'),
-        
+
         /** Maximum total exposure in USD (0 = unlimited) */
         maxTotalExposureUsd: parseFloat(process.env.MAX_TOTAL_EXPOSURE_USD || '0'),
-        
+
         /** Tokens to ignore (comma-separated addresses) */
         blacklistedTokens: parseList(process.env.BLACKLISTED_TOKENS, []),
-        
+
         /** Require manual confirmation for large transactions */
         manualConfirmationThresholdUsd: parseFloat(process.env.MANUAL_CONFIRM_THRESHOLD_USD || '100000'),
     } as RiskManagementConfig,
-    
+
     // ---------------------------------------------------------------------
     // Logging & Debugging
     // ---------------------------------------------------------------------
-    
+
     /** 
      * Log level: 0=SILENT, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=TRACE
      * @see LogLevel enum in utils/logger.ts
      */
     LOG_LEVEL: parseInt(process.env.LOG_LEVEL || '3', 10) as LogLevel,
-    
+
     /** Enable verbose API logging (may expose sensitive data) */
     DEBUG_API: process.env.DEBUG_API === 'true',
-    
+
 } as const;
 
 // ============================================================================
@@ -246,37 +246,37 @@ export const CONFIG = {
 
 export function validateConfig(): string[] {
     const errors: string[] = [];
-    
+
     // Validate private key format
     if (!CONFIG.PRIVATE_KEY.match(/^0x[a-fA-F0-9]{64}$/)) {
         errors.push('PRIVATE_KEY must be a valid 64-character hex string with 0x prefix');
     }
-    
+
     // Validate address format
     if (!CONFIG.MARKET_MAKER_ADDRESS.match(/^0x[a-fA-F0-9]{40}$/i)) {
         errors.push('MARKET_MAKER_ADDRESS must be a valid Ethereum address');
     }
-    
+
     // Validate spread is reasonable
     if (CONFIG.BIDDING.priceSpread <= 0 || CONFIG.BIDDING.priceSpread > 1) {
         errors.push('PRICE_SPREAD must be between 0 and 1 (e.g., 0.98 = 98% of market price)');
     }
-    
+
     // Validate liquidation ratio
     if (CONFIG.LIQUIDATION.maxLiquidationRatio <= 0 || CONFIG.LIQUIDATION.maxLiquidationRatio > 1) {
         errors.push('LIQUIDATION_MAX_RATIO must be between 0 and 1');
     }
-    
+
     // Validate poll intervals aren't too aggressive
     if (CONFIG.MONITORING.biddingPollIntervalMs < 1000) {
         errors.push('BIDDING_POLL_INTERVAL_MS should be at least 1000ms to avoid rate limiting');
     }
-    
+
     // Warn about wildcard token acceptance
     if (CONFIG.ACCEPTED_TOKENS[0] === '*') {
         console.warn('⚠️  ACCEPTED_TOKENS is set to "*" - accepting all tokens. This is risky for production.');
     }
-    
+
     return errors;
 }
 
