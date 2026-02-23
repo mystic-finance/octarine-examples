@@ -193,7 +193,7 @@ async function checkLiquidationBidStatus(bidId: string): Promise<string | null> 
 function logLiquidationBidStats(): void {
     const now = Date.now();
     if (now - liquidationBidStats.lastLogged < 60000) return; // Log every 60s
-    
+
     liquidationBidStats.lastLogged = now;
     console.log(`[Liquidation Bids] Total: ${liquidationBidStats.total}, Accepted: ${liquidationBidStats.accepted}, Pending: ${liquidationBidStats.pending}, Failed: ${liquidationBidStats.failed}`);
 }
@@ -283,7 +283,7 @@ function calculateLiquidationAmounts(liquidation: Liquidation): LiquidationAmoun
 
     // Use configured max liquidation ratio (typically 50-80%)
     const maxRatio = CONFIG.LIQUIDATION.maxLiquidationRatio;
-    
+
     // Calculate amounts based on max ratio
     const debtToRepay = debtAmount.multipliedBy(maxRatio);
     const collateralToSeize = maxSeizable.multipliedBy(maxRatio);
@@ -309,7 +309,7 @@ function calculateLiquidationAmounts(liquidation: Liquidation): LiquidationAmoun
             .integerValue(BigNumber.ROUND_DOWN)
             .toString(),
         profitWei: profitWei.toString(),
-        decimals,
+        debtDecimals: decimals,
         collateralDecimals,
     };
 }
@@ -372,7 +372,7 @@ function buildLiquidationOrderInfo(
     amounts: LiquidationAmounts,
 ): LiquidationOrderInfo {
     const salt = Date.now().toString();
-    
+
     // Calculate expiry based on configuration
     const expiryMinutes = CONFIG.LIQUIDATION.bidExpiryMinutes;
     const expiry = Math.floor(Date.now() / 1000) + (expiryMinutes * 60);
@@ -741,7 +741,7 @@ async function processSingleLiquidation(
         if (bidId) {
             liquidationBidStats.total++;
             liquidationBidStats.pending++;
-            
+
             // Check status asynchronously
             setTimeout(async () => {
                 const status = await checkLiquidationBidStatus(bidId);
