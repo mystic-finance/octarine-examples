@@ -158,6 +158,47 @@ interface LiquidationAmounts {
 const liquidationCircuitBreaker = new CircuitBreaker(5, 60000);
 
 // ============================================================================
+// BID STATUS TRACKING
+// ============================================================================
+
+/** Simple bid statistics tracker */
+const liquidationBidStats = {
+    accepted: 0,
+    pending: 0,
+    failed: 0,
+    total: 0,
+    lastLogged: 0,
+};
+
+/**
+ * Fetch bid status from API
+ * @see https://curator-api.mysticfinance.xyz/docs/#/Octarine/OctarineController_getBid
+ */
+async function checkLiquidationBidStatus(bidId: string): Promise<string | null> {
+    try {
+        const response = await axios.get(
+            `${CONFIG.API_BASE_URL}/octarine/bid/${bidId}`,
+            {
+                headers: CONFIG.API_KEY ? { 'x-api-key': CONFIG.API_KEY } : {},
+                timeout: 5000,
+            }
+        );
+        return response.data.data?.status || null;
+    } catch {
+        return null;
+    }
+}
+
+/** Log bid statistics periodically */
+function logLiquidationBidStats(): void {
+    const now = Date.now();
+    if (now - liquidationBidStats.lastLogged < 60000) return; // Log every 60s
+    
+    liquidationBidStats.lastLogged = now;
+    console.log(`[Liquidation Bids] Total: ${liquidationBidStats.total}, Accepted: ${liquidationBidStats.accepted}, Pending: ${liquidationBidStats.pending}, Failed: ${liquidationBidStats.failed}`);
+}
+
+// ============================================================================
 // STEP 1: FETCH LIQUIDATION OPPORTUNITIES
 // ============================================================================
 
@@ -451,14 +492,15 @@ async function signLiquidationOrder(
  * The API handles the settlement; we just need to submit our signed order.
  * 
  * @param params - Liquidation parameters including signature
+ * @returns API response with bidId and status
  */
-async function triggerLiquidation(params: TriggerLiquidationRequest): Promise<void> {
+async function triggerLiquidation(params: TriggerLiquidationRequest): Promise<any> {
     logger.info(`Triggering liquidation ${params.liquidationId}`, {
         liquidationId: params.liquidationId,
         debtAmount: params.debtAmountToLiquidate,
     });
 
-    await retry(
+    return retry(
         async () => {
             const response = await axios.post(
                 `${CONFIG.API_BASE_URL}/octarine/liquidations/bid`,
@@ -476,6 +518,8 @@ async function triggerLiquidation(params: TriggerLiquidationRequest): Promise<vo
                 liquidationId: params.liquidationId,
                 txHash: response.data.txHash,
             });
+
+            return response.data;
         },
         {
             maxRetries: 3,
@@ -683,7 +727,7 @@ async function processSingleLiquidation(
         const { order, signature } = await signLiquidationOrder(orderInfo);
 
         // Submit liquidation bid (expiry is in minutes, convert to what API expects)
-        await triggerLiquidation({
+        const response = await triggerLiquidation({
             liquidationId: liquidation._id,
             marketMaker: CONFIG.MARKET_MAKER_ADDRESS,
             signature,
@@ -691,6 +735,23 @@ async function processSingleLiquidation(
             orderInfo: order,
             debtAmountToLiquidate: parseInt(amounts.debtToRepay) / 10 ** amounts.debtDecimals,
         });
+
+        // Track bid status
+        const bidId = response?.bidId || response?.data?.bidId;
+        if (bidId) {
+            liquidationBidStats.total++;
+            liquidationBidStats.pending++;
+            
+            // Check status asynchronously
+            setTimeout(async () => {
+                const status = await checkLiquidationBidStatus(bidId);
+                if (status) {
+                    liquidationBidStats.pending--;
+                    if (status === 'accepted') liquidationBidStats.accepted++;
+                    else if (status === 'failed') liquidationBidStats.failed++;
+                }
+            }, 5000);
+        }
 
         logger.success(`Successfully processed liquidation ${liquidation._id}`, 0, context);
 
@@ -755,6 +816,9 @@ export async function startLiquidationMonitor(): Promise<void> {
                 logger.error('Error in liquidation monitor', {}, error);
             }
         }
+
+        // Log bid statistics periodically
+        logLiquidationBidStats();
 
         // Calculate sleep time
         const elapsed = Date.now() - loopStart;

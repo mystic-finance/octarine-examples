@@ -110,22 +110,53 @@ interface SubmitBidRequest {
     activeFrom?: number;
 }
 
-/**
- * A bid that was accepted by the system
- */
-interface WonBid {
-    bidId: string;
-    requestId: string;
-    marketMaker: string;
-    status: string;
-}
-
 // ============================================================================
 // CIRCUIT BREAKER FOR API RESILIENCE
 // ============================================================================
 
 /** Circuit breaker to prevent overwhelming the API during issues */
 const apiCircuitBreaker = new CircuitBreaker(5, 60000);
+
+// ============================================================================
+// BID STATUS TRACKING
+// ============================================================================
+
+/** Simple bid statistics tracker */
+const redemptionBidStats = {
+    accepted: 0,
+    pending: 0,
+    failed: 0,
+    total: 0,
+    lastLogged: 0,
+};
+
+/**
+ * Fetch bid status from API
+ * @see https://curator-api.mysticfinance.xyz/docs/#/Octarine/OctarineController_getBid
+ */
+async function checkRedemptionBidStatus(bidId: string): Promise<string | null> {
+    try {
+        const response = await axios.get(
+            `${CONFIG.API_BASE_URL}/octarine/bid/${bidId}`,
+            {
+                headers: CONFIG.API_KEY ? { 'x-api-key': CONFIG.API_KEY } : {},
+                timeout: 5000,
+            }
+        );
+        return response.data.data?.status || null;
+    } catch {
+        return null;
+    }
+}
+
+/** Log bid statistics periodically */
+function logRedemptionBidStats(): void {
+    const now = Date.now();
+    if (now - redemptionBidStats.lastLogged < 60000) return; // Log every 60s
+    
+    redemptionBidStats.lastLogged = now;
+    console.log(`[Redemption Bids] Total: ${redemptionBidStats.total}, Accepted: ${redemptionBidStats.accepted}, Pending: ${redemptionBidStats.pending}, Failed: ${redemptionBidStats.failed}`);
+}
 
 // ============================================================================
 // STEP 1: FETCH PENDING RFQ REQUESTS
@@ -270,14 +301,15 @@ async function signRFQOrder(
  * This enters the market maker into the auction for this RFQ.
  * 
  * @param params - Bid submission parameters including signature
+ * @returns API response with bidId
  */
-async function submitBid(params: SubmitBidRequest): Promise<void> {
+async function submitBid(params: SubmitBidRequest): Promise<any> {
     logger.debug(`Submitting bid for request ${params.requestId}`, {
         requestId: params.requestId,
         makerAmount: params.makerAmount,
     });
 
-    await retry(
+    return retry(
         async () => {
             const response = await axios.post(
                 `${CONFIG.API_BASE_URL}/octarine/bid`,
@@ -295,6 +327,8 @@ async function submitBid(params: SubmitBidRequest): Promise<void> {
                 requestId: params.requestId,
                 bidId: response.data.data?.bidId,
             });
+
+            return response.data;
         },
         {
             maxRetries: 3,
@@ -470,105 +504,6 @@ async function checkSufficientBalance(
 }
 
 // ============================================================================
-// STEP 4: TRANSFORM WON BIDS
-// ============================================================================
-
-/**
- * Call the transform endpoint to settle a winning bid.
- * This executes the on-chain settlement of the trade.
- * 
- * @param requestId - The winning request ID
- */
-async function callTransform(requestId: string): Promise<void> {
-    logger.info(`Triggering transform for won bid`, { requestId });
-
-    await retry(
-        async () => {
-            const response = await axios.post(
-                `${CONFIG.API_BASE_URL}/octarine/transform`,
-                { requestId },
-                {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        ...(CONFIG.API_KEY ? { 'x-api-key': CONFIG.API_KEY } : {}),
-                    },
-                    timeout: 30000,
-                },
-            );
-
-            if (response.data.txHash) {
-                logger.success(`Transform executed`, 0, {
-                    requestId,
-                    txHash: response.data.txHash,
-                });
-            }
-        },
-        {
-            maxRetries: 3,
-            context: { operation: 'callTransform', requestId },
-            onRetry: (attempt, error) => {
-                // Don't retry on "Already executed" errors
-                if (error?.response?.data?.message === 'Already executed') {
-                    throw new Error('Already executed');
-                }
-            },
-        }
-    ).catch((error: any) => {
-        if (error.message === 'Already executed' || 
-            error?.response?.data?.message === 'Already executed') {
-            logger.debug(`Transform already executed`, { requestId });
-            return;
-        }
-        throw error;
-    });
-}
-
-/**
- * Monitor for bids that have been accepted and trigger their settlement.
- */
-async function monitorWonBids(processedRequests: Set<string>): Promise<void> {
-    try {
-        await apiCircuitBreaker.execute(async () => {
-            const response = await axios.get(
-                `${CONFIG.API_BASE_URL}/octarine/market-maker/${CONFIG.MARKET_MAKER_ADDRESS}/bids`,
-                {
-                    params: {
-                        status: 'accepted',
-                        limit: 50,
-                    },
-                    timeout: 10000,
-                },
-            );
-
-            const wonBids: WonBid[] = response.data.bids || [];
-
-            for (const bid of wonBids) {
-                const transformKey = `transform-${bid.requestId}`;
-                
-                if (processedRequests.has(transformKey)) {
-                    continue;
-                }
-
-                logger.info(`🎉 Bid won! Processing settlement`, {
-                    requestId: bid.requestId,
-                    bidId: bid.bidId,
-                });
-
-                await callTransform(bid.requestId);
-                processedRequests.add(transformKey);
-            }
-        });
-    } catch (error: any) {
-        // Circuit breaker open is expected, don't log as error
-        if (error.message.includes('Circuit breaker is OPEN')) {
-            logger.warn('Circuit breaker open - skipping won bids check');
-        } else {
-            logger.error('Failed to check won bids', {}, error);
-        }
-    }
-}
-
-// ============================================================================
 // MAIN BIDDING FLOW
 // ============================================================================
 
@@ -633,7 +568,7 @@ async function processSingleRequest(
         const bidExpirySeconds = CONFIG.BIDDING.bidExpiryMinutes * 60;
 
         // Submit the bid
-        await submitBid({
+        const response = await submitBid({
             requestId: request.requestId,
             maker: CONFIG.MARKET_MAKER_ADDRESS,
             makerAmount,
@@ -641,6 +576,23 @@ async function processSingleRequest(
             signature,
             activeFrom: 0, // Active immediately
         });
+
+        // Track bid status
+        const bidId = response?.bidId || response?.data?.bidId;
+        if (bidId) {
+            redemptionBidStats.total++;
+            redemptionBidStats.pending++;
+            
+            // Check status asynchronously
+            setTimeout(async () => {
+                const status = await checkRedemptionBidStatus(bidId);
+                if (status) {
+                    redemptionBidStats.pending--;
+                    if (status === 'accepted') redemptionBidStats.accepted++;
+                    else if (status === 'failed') redemptionBidStats.failed++;
+                }
+            }, 5000);
+        }
 
         logger.success(`Successfully bid on ${request.requestId}`, 0, context);
 
@@ -697,14 +649,9 @@ export async function startBiddingLoop(): Promise<void> {
                 processedRequests.add(request.requestId);
             }
 
-            // 3. Check for and settle won bids
-            await monitorWonBids(processedRequests);
-
-            // 4. Memory management - clean up old entries
+            // 3. Memory management - clean up old entries
             if (processedRequests.size > CONFIG.MONITORING.maxTrackedRequests) {
-                const requestIds = Array.from(processedRequests).filter(
-                    id => !id.startsWith('transform-')
-                );
+                const requestIds = Array.from(processedRequests);
                 if (requestIds.length > CONFIG.MONITORING.maxTrackedRequests / 2) {
                     const toRemove = requestIds.slice(0, Math.floor(requestIds.length / 2));
                     toRemove.forEach(id => processedRequests.delete(id));
@@ -715,6 +662,9 @@ export async function startBiddingLoop(): Promise<void> {
         } catch (error: any) {
             logger.error('Error in bidding loop', {}, error);
         }
+
+        // Log bid statistics periodically
+        logRedemptionBidStats();
 
         // Calculate time to next poll
         const elapsed = Date.now() - loopStart;
