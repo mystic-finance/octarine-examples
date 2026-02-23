@@ -171,7 +171,6 @@ function logRedemptionBidStats(): void {
 async function getPendingRequests(): Promise<RFQRequest[]> {
     return retry(
         async () => {
-            console.log(CONFIG)
             const response = await axios.get(
                 `${CONFIG.API_BASE_URL}/octarine/requests`,
                 {
