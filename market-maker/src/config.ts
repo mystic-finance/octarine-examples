@@ -52,6 +52,13 @@ export interface BiddingConfig {
     bidExpiryMinutes: number;
 }
 
+export interface SettlementConfig {
+    /** Type of settlement: 'instant' or 'delayed' */
+    settlementType: 'instant' | 'delayed';
+    /** Estimated settlement time in hours (required for delayed settlement) */
+    estimatedSettlementTimeHours?: number;
+}
+
 export interface MonitoringConfig {
     /** Polling interval for new RFQ requests (milliseconds) */
     biddingPollIntervalMs: number;
@@ -189,6 +196,26 @@ export const CONFIG = {
         bidExpiryMinutes: parseInt(process.env.BIDDING_BID_EXPIRY_MIN || '60', 10),
     } as BiddingConfig,
 
+    // ---------------------------------------------------------------------
+    // Settlement Settings
+    // ---------------------------------------------------------------------
+    
+    SETTLEMENT: {
+        /** 
+         * Settlement type: 'instant' for immediate settlement,
+         * 'delayed' for bid now, settle later (default: 'instant').
+         */
+        settlementType: (process.env.SETTLEMENT_TYPE || 'instant') as SettlementConfig['settlementType'],
+        
+        /** 
+         * Estimated settlement time in hours.
+         * Only applicable and required when settlementType is 'delayed'.
+         */
+        estimatedSettlementTimeHours: process.env.ESTIMATED_SETTLEMENT_TIME 
+            ? parseInt(process.env.ESTIMATED_SETTLEMENT_TIME, 10) 
+            : undefined,
+    } as SettlementConfig,
+    
     // ---------------------------------------------------------------------
     // Monitoring Settings
     // ---------------------------------------------------------------------
