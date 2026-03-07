@@ -108,6 +108,10 @@ interface SubmitBidRequest {
     signature: Signature;
     /** Unix timestamp when bid becomes active (0 = immediately) */
     activeFrom?: number;
+    /** Settlement type: 'instant' or 'delayed' */
+    settlementType?: 'instant' | 'delayed';
+    /** Estimated settlement time in hours (required for delayed settlement) */
+    estimatedSettlementTime?: number;
 }
 
 // ============================================================================
@@ -307,6 +311,8 @@ async function submitBid(params: SubmitBidRequest): Promise<any> {
     logger.debug(`Submitting bid for request ${params.requestId}`, {
         requestId: params.requestId,
         makerAmount: params.makerAmount,
+        settlementType: params.settlementType,
+        estimatedSettlementTime: params.estimatedSettlementTime,
     });
 
     return retry(
@@ -326,6 +332,7 @@ async function submitBid(params: SubmitBidRequest): Promise<any> {
             logger.success(`Bid submitted for ${params.requestId}`, 0, {
                 requestId: params.requestId,
                 bidId: response.data.data?.bidId,
+                settlementType: params.settlementType,
             });
 
             return response.data;
@@ -567,15 +574,28 @@ async function processSingleRequest(
         // Calculate bid expiry (relative to now)
         const bidExpirySeconds = CONFIG.BIDDING.bidExpiryMinutes * 60;
 
-        // Submit the bid
-        const response = await submitBid({
+        // Build bid payload with settlement configuration
+        const bidPayload: SubmitBidRequest = {
             requestId: request.requestId,
             maker: CONFIG.MARKET_MAKER_ADDRESS,
             makerAmount,
             expiry: bidExpirySeconds,
             signature,
             activeFrom: 0, // Active immediately
-        });
+            settlementType: CONFIG.SETTLEMENT.settlementType,
+        };
+
+        // Only include estimated settlement time for delayed settlements
+        if (CONFIG.SETTLEMENT.settlementType === 'delayed' && CONFIG.SETTLEMENT.estimatedSettlementTimeHours) {
+            bidPayload.estimatedSettlementTime = CONFIG.SETTLEMENT.estimatedSettlementTimeHours;
+            logger.info(`Submitting delayed settlement bid`, {
+                requestId: request.requestId,
+                estimatedSettlementTimeHours: CONFIG.SETTLEMENT.estimatedSettlementTimeHours,
+            });
+        }
+
+        // Submit the bid
+        const response = await submitBid(bidPayload);
 
         // Track bid status
         const bidId = response?.bidId || response?.data?.bidId;
@@ -623,6 +643,7 @@ export async function startBiddingLoop(): Promise<void> {
     logger.info(`Spread: ${(1 - CONFIG.BIDDING.priceSpread) * 100}%`);
     logger.info(`Min Bid: ${CONFIG.BIDDING.minBidAmountWei} wei`);
     logger.info(`Chains: [${CONFIG.SUPPORTED_CHAINS.join(', ')}]`);
+    logger.info(`Settlement: ${CONFIG.SETTLEMENT.settlementType}${CONFIG.SETTLEMENT.settlementType === 'delayed' && CONFIG.SETTLEMENT.estimatedSettlementTimeHours ? ` (~${CONFIG.SETTLEMENT.estimatedSettlementTimeHours}h)` : ''}`);
     logger.info('==========================================\n');
 
     // Track processed requests to avoid re-bidding

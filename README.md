@@ -139,6 +139,10 @@ MARKET_MAKER_API_KEY=your-key        # Your Octarine API key
 # Pricing
 PRICE_SPREAD=0.98                    # 2% profit margin (0.98 = 98% of market price)
 
+# Settlement
+SETTLEMENT_TYPE=instant              # 'instant' (default) or 'delayed'
+ESTIMATED_SETTLEMENT_TIME=24         # Hours until settlement (required for delayed)
+
 # Chains & Tokens
 SUPPORTED_CHAINS=98866               # Plume mainnet
 ACCEPTED_TOKENS=*                    # Accept all, or comma-separated addresses
