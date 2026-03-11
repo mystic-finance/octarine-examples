@@ -3,7 +3,7 @@
 [![Documentation](https://img.shields.io/badge/docs-mysticfinance.xyz-blue)](https://docs.mysticfinance.xyz)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-This repository contains production-ready example implementations for interacting with the **Octarine** protocol by Mystic Finance. Octarine enables instant redemptions of RWA (Real World Asset) tokens through a competitive market maker mechanism.
+This repository contains production-ready example implementations for interacting with the **Octarine** protocol by Mystic Finance. Octarine enables instant redemptions of RWAs (Real-World Assets) through a competitive auction mechanism.
 
 ## 📚 Table of Contents
 
@@ -55,7 +55,7 @@ Octarine consists of two main components:
 
 - Node.js 18+ (with npm)
 - An EVM wallet with private key
-- Octarine API key ([Request access](https://mysticfinance.xyz))
+- Octarine API key ([Request access](mailto:joao.moreira@octarine.finance))
 
 ### 1. Clone and Setup
 
@@ -96,7 +96,6 @@ Located in `/market-maker/`, this is a production-ready trading bot for professi
 
 - ✅ **RFQ Bidding**: Compete on redemption quotes with automatic order signing
 - ✅ **Liquidation Monitor**: Earn liquidation bonuses from underwater positions
-- ✅ **Gas Optimization**: EIP-1559 support with configurable gas strategies
 - ✅ **Resilient Architecture**: Circuit breakers, exponential backoff, error recovery
 - ✅ **Risk Management**: Token whitelisting, position limits, blacklists
 - ✅ **Structured Logging**: Configurable log levels with context
@@ -144,7 +143,7 @@ SETTLEMENT_TYPE=instant              # 'instant' (default) or 'delayed'
 ESTIMATED_SETTLEMENT_TIME=24         # Hours until settlement (required for delayed)
 
 # Chains & Tokens
-SUPPORTED_CHAINS=98866               # Plume mainnet
+SUPPORTED_CHAINS=98866               # Plume Mainnet
 ACCEPTED_TOKENS=*                    # Accept all, or comma-separated addresses
 
 # Liquidation Settings
@@ -343,7 +342,7 @@ We welcome contributions! Please follow these steps:
 ## Support
 
 - 📖 [Documentation](https://docs.mysticfinance.xyz)
-- 💬 [Discord](https://discord.gg/mystic)
+- 💬 [Discord](https://discord.gg/4RMEwstu5x)
 - 🐛 [Issue Tracker](https://github.com/mystic-finance/octarine-examples/issues)
 
 ---
