@@ -6,7 +6,10 @@
     "scripts": {
         "dev": "vite",
         "build": "tsc && vite build",
-        "preview": "vite preview"
+        "preview": "vite preview",
+        "automated-swap": "tsx src/scripts/automated-swap.ts",
+        "automated-swap:curator": "cross-env VITE_API_URL=https://curator-api.mysticfinance.xyz tsx src/scripts/automated-swap.ts",
+        "automated-swap:main": "cross-env VITE_API_URL=https://api.mysticfinance.xyz tsx src/scripts/automated-swap.ts"
     },
     "dependencies": {
         "axios": "^1.6.0",
@@ -15,9 +18,13 @@
         "react-dom": "^18.2.0"
     },
     "devDependencies": {
+        "@types/node": "^20.8.0",
         "@types/react": "^18.2.15",
         "@types/react-dom": "^18.2.7",
         "@vitejs/plugin-react": "^4.0.3",
+        "cross-env": "^7.0.3",
+        "dotenv": "^16.3.1",
+        "tsx": "^4.7.0",
         "typescript": "^5.0.2",
         "vite": "^4.4.5"
     }

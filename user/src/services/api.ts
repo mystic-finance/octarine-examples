@@ -20,18 +20,23 @@
  * 4. Record the fill with `recordFill()`
  */
 
-import axios, { AxiosError, AxiosRequestConfig } from 'axios';
+import axios from 'axios';
 import { ethers, Signer } from 'ethers';
+import * as dotenv from 'dotenv';
+dotenv.config();
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
 /** Base URL for the Octarine API */
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://api.mysticfinance.xyz';
+const API_BASE_URL =
+    (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL) ||
+    (typeof process !== 'undefined' && process.env?.VITE_API_URL) ||
+    'https://api.mysticfinance.xyz';
 
 /** Default timeout for API requests (ms) */
-const DEFAULT_TIMEOUT = 30000;
+const DEFAULT_TIMEOUT = 60000;
 
 /** Default retry attempts for failed requests */
 const MAX_RETRIES = 3;
@@ -80,6 +85,8 @@ export interface QuoteResponse {
     };
     /** Transaction data (for instant swaps) */
     txn?: TransactionData;
+    /** Multiple transactions (if applicable) */
+    txns?: TransactionData[];
 }
 
 /**
@@ -106,8 +113,10 @@ export interface MarketMakerBid {
     marketMaker: string;
     /** Amount they're offering */
     makerAmount: string;
-    /** Transaction data to execute */
-    txn: TransactionData;
+    /** Transaction data to execute (single) */
+    txn?: TransactionData;
+    /** Transaction data to execute (multiple) */
+    txns?: TransactionData[];
 }
 
 /**
@@ -200,6 +209,7 @@ async function withRetry<T>(
  */
 export async function createQuoteRequest(params: QuoteRequestParams): Promise<QuoteResponse> {
     const { walletAddress, redeemAsset, redemptionAsset, amount, chainId, slippageTolerance = 1 } = params;
+    console.log({ API_BASE_URL })
 
     console.log('[Swap] Requesting quote:', {
         sell: `${amount} of ${redeemAsset.slice(0, 10)}...`,
@@ -288,7 +298,7 @@ export async function executeTransaction(
 
         // Wait for confirmation (1 confirmation for speed, can increase for security)
         const receipt = await tx.wait(1);
-        
+
         if (receipt.status === 0) {
             throw new Error('Transaction failed on-chain');
         }
@@ -302,7 +312,7 @@ export async function executeTransaction(
         return receipt.transactionHash;
     } catch (error: any) {
         console.error('[Swap] Transaction failed:', error.message);
-        
+
         // Provide more helpful error messages
         if (error.code === 'INSUFFICIENT_FUNDS') {
             throw new Error('Insufficient funds for gas fees');
@@ -313,7 +323,7 @@ export async function executeTransaction(
         if (error.code === 'ACTION_REJECTED') {
             throw new Error('Transaction rejected by user');
         }
-        
+
         throw error;
     }
 }
@@ -430,28 +440,36 @@ export async function pollForBids(
                 // Select the best bid based on strategy
                 const selectedBid = selectBid(bids, bidStrategy);
 
-                if (!selectedBid.txn) {
-                    throw new Error('Selected bid has no transaction data');
-                }
-
                 console.log(`[Swap] Selected bid from ${selectedBid.marketMaker.slice(0, 10)}...`, {
                     makerAmount: selectedBid.makerAmount,
                     bidId: selectedBid.bidId,
+                    txnTaskCount: selectedBid.txns?.length || 1,
                 });
 
-                // Execute the transaction
-                const txHash = await executeTransaction(selectedBid.txn, signer);
+                // Execute all transactions in the bid
+                let lastTxHash = '';
+                if (selectedBid.txns && selectedBid.txns.length > 0) {
+                    console.log(`[Swap] Executing ${selectedBid.txns.length} transactions for bid...`);
+                    for (const [index, txn] of selectedBid.txns.entries()) {
+                        console.log(`[Swap] Executing txn ${index + 1}/${selectedBid.txns.length}...`);
+                        lastTxHash = await executeTransaction(txn, signer);
+                    }
+                } else if (selectedBid.txn) {
+                    lastTxHash = await executeTransaction(selectedBid.txn, signer);
+                } else {
+                    throw new Error('Selected bid has no transaction data (neither txn nor txns)');
+                }
 
-                // Record the fill
+                // Record the fill using the last transaction hash
                 await recordFill(
                     requestId,
-                    txHash,
+                    lastTxHash,
                     selectedBid.makerAmount,
                     selectedBid.marketMaker,
                     selectedBid.bidId
                 );
 
-                return { success: true, txHash };
+                return { success: true, txHash: lastTxHash };
             }
 
             // No bids yet, continue polling
@@ -461,7 +479,7 @@ export async function pollForBids(
 
         } catch (error: any) {
             console.error(`[Swap] Polling error on attempt ${attempt}:`, error.message);
-            
+
             // Continue polling unless it's a fatal error
             if (error?.response?.status === 404) {
                 return { success: false, error: 'Request not found' };
